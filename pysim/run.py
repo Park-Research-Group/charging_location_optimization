@@ -12,7 +12,8 @@ from .network import World
 from .outputs import write_agent_file
 
 
-def run_loading(input_dir, output_dir, reroute_callback=None):
+def run_loading(input_dir, output_dir, reroute_callback=None,
+                charging=None):
     world = World(input_dir)
     world.reroute_callback = reroute_callback
     if world.flow_model != 2:
@@ -29,6 +30,29 @@ def run_loading(input_dir, output_dir, reroute_callback=None):
     sim.network_loading()
     os.makedirs(output_dir, exist_ok=True)
     write_agent_file(world, os.path.join(output_dir, "output_agent.csv"))
+    # Charging accounting post-pass. charging=None means auto: it runs
+    # when input_charger.csv is present, with default parameters.
+    # charging=False disables it always; a dict enables it with those
+    # parameters overriding the defaults (and requires the file).
+    charger_path = os.path.join(input_dir, "input_charger.csv")
+    charge_cfg = None
+    if charging is False:
+        charge_cfg = None
+    elif isinstance(charging, dict):
+        if not os.path.exists(charger_path):
+            raise ProgramStop(
+                "charging requested but input_charger.csv is missing")
+        from .charging import DEFAULT_CONFIG
+        charge_cfg = dict(DEFAULT_CONFIG)
+        charge_cfg.update(charging)
+    elif os.path.exists(charger_path):
+        from .charging import DEFAULT_CONFIG
+        charge_cfg = dict(DEFAULT_CONFIG)
+    if charge_cfg is not None:
+        from .charging import run_charging
+        world.charging_summary = run_charging(world, output_dir, charge_cfg)
+    else:
+        world.charging_summary = None
     return world
 
 

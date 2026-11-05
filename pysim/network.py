@@ -146,7 +146,8 @@ class Vehicle:
         "demand_type", "vehicle_type", "pce", "info_type", "vot", "age",
         "distance", "trip_fftt", "delay", "node_size", "link_ary",
         "original_link_ary", "original_node_size", "loaded", "complete",
-        "sim_link_seq", "leaving_buffer_time", "time_to_retrieve_info")
+        "sim_link_seq", "leaving_buffer_time", "time_to_retrieve_info",
+        "home_charger", "soc_start_kwh", "soc_end_kwh")
 
     def __init__(self, agent_id):
         self.agent_id = agent_id
@@ -180,6 +181,9 @@ class Vehicle:
         self.sim_link_seq = 0
         self.leaving_buffer_time = f32(0)
         self.time_to_retrieve_info = f32(0)
+        self.home_charger = 0
+        self.soc_start_kwh = 0.0
+        self.soc_end_kwh = 0.0
 
 
 class DemandType:
@@ -235,6 +239,12 @@ class World:
         self.vehicle_type_names = []
         self.vehicle_type_pce = []
         self.vehicle_type_age_pct = []
+        # EV attributes per vehicle type (charging layer): battery size
+        # in kWh, electric flag, consumption in kWh/km. Absent columns
+        # default to non-electric, so old input files still run.
+        self.vehicle_type_battery = []
+        self.vehicle_type_is_electric = []
+        self.vehicle_type_consumption = []
         # vehicles: g_VehicleMap (sorted by agent_id) + creation order list
         self.vehicles = {}
         self.vehicle_order = []
@@ -700,6 +710,9 @@ class World:
                 break
             ok, name = parser.get("vehicle_type_name", "str")
             okp, pce = parser.get("PCE", "float")
+            okb, battery = parser.get("battery_kwh", "float")
+            oke, is_electric = parser.get("is_electric", "int")
+            okc, consumption = parser.get("consumption_kwh_per_km", "float")
             ages = []
             for col in ("percentage_of_age_0", "percentage_of_age_5",
                         "percentage_of_age_10", "percentage_of_age_15"):
@@ -709,9 +722,18 @@ class World:
                 self.vehicle_type_names.append("")
                 self.vehicle_type_pce.append(f32(1))
                 self.vehicle_type_age_pct.append([])
+                self.vehicle_type_battery.append(0.0)
+                self.vehicle_type_is_electric.append(0)
+                self.vehicle_type_consumption.append(0.0)
             self.vehicle_type_names[vtype - 1] = name if ok else ""
             self.vehicle_type_pce[vtype - 1] = pce if okp else f32(1)
             self.vehicle_type_age_pct[vtype - 1] = ages
+            self.vehicle_type_battery[vtype - 1] = float(battery) \
+                if okb else 0.0
+            self.vehicle_type_is_electric[vtype - 1] = is_electric \
+                if oke else 0
+            self.vehicle_type_consumption[vtype - 1] = float(consumption) \
+                if okc else 0.0
             self.vehicle_types_ordered.append((vtype, name if ok else ""))
 
     # ----- demand files (g_ReadDemandFileBasedOnDemandFileList) -----
@@ -788,6 +810,9 @@ class World:
         ok, tour_id = parser.get("tour_id", "int")
         if ok and tour_id >= 0:
             veh.tour_id = tour_id
+        ok, home = parser.get("home_charger", "int")
+        if ok and home >= 1:
+            veh.home_charger = 1
         ok, from_zone = parser.get("from_zone_id", "int", required=True)
         if not ok:
             return

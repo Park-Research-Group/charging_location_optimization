@@ -15,13 +15,15 @@ import os
 from .run import run_loading
 
 
-def run_pysim(input_dir, output_dir, verbose=False, reroute_callback=None):
+def run_pysim(input_dir, output_dir, verbose=False, reroute_callback=None,
+              charging=None):
     """Run one PySim loading pass.
 
     input_dir is a directory holding DTALite-format input files. It is
     read, never written, and it does not need to be called
     DTALite_Files or anything else: any name works. output_dir is
-    created if needed and receives output_agent.csv, the only output.
+    created if needed and receives output_agent.csv, the only traffic
+    output.
 
     reroute_callback is None by default (no hook: vehicles follow their
     paths except for the built-in info-type adjustments). When given,
@@ -32,11 +34,19 @@ def run_pysim(input_dir, output_dir, verbose=False, reroute_callback=None):
     returned list must be a connected chain from that node to the
     vehicle's destination. Bad chains raise ProgramStop.
 
-    Returns a dict with the input/output dirs, the agent output path,
-    and the agent counts. Raises ProgramStop (from pysim.cpp) on
-    out-of-scope scenarios: flow models other than Newell (2),
-    scenarios requesting more than one iteration, or a reroute chain
-    that fails validation.
+    charging controls the charging accounting post-pass (see README):
+    None (default) runs it when input_charger.csv is present, with
+    default parameters; False disables it; a dict enables it with
+    those parameters overriding the defaults. When it runs, three
+    more files are written: output_charging.csv,
+    output_charger_summary.csv, and output_stranded.csv.
+
+    Returns a dict with the input/output dirs, the output paths, the
+    agent counts, and the charging summary (or None). Raises ProgramStop
+    (from pysim.cpp) on out-of-scope scenarios: flow models other than
+    Newell (2), scenarios requesting more than one iteration, a reroute
+    chain that fails validation, or charging requested without its
+    input file.
     """
     input_dir = os.path.abspath(input_dir)
     output_dir = os.path.abspath(output_dir)
@@ -45,17 +55,27 @@ def run_pysim(input_dir, output_dir, verbose=False, reroute_callback=None):
     if verbose:
         print("pysim: %s -> %s" % (input_dir, output_dir))
     world = run_loading(input_dir, output_dir,
-                        reroute_callback=reroute_callback)
+                        reroute_callback=reroute_callback,
+                        charging=charging)
     agents = len(world.vehicles)
     completed = sum(1 for veh in world.vehicles.values() if veh.complete)
+    outputs = {
+        "agent": os.path.join(output_dir, "output_agent.csv"),
+    }
+    if world.charging_summary is not None:
+        outputs["charging"] = os.path.join(output_dir,
+                                           "output_charging.csv")
+        outputs["charger_summary"] = os.path.join(
+            output_dir, "output_charger_summary.csv")
+        outputs["stranded"] = os.path.join(output_dir,
+                                           "output_stranded.csv")
     result = {
         "input_dir": input_dir,
         "output_dir": output_dir,
-        "outputs": {
-            "agent": os.path.join(output_dir, "output_agent.csv"),
-        },
+        "outputs": outputs,
         "agents": agents,
         "completed": completed,
+        "charging": world.charging_summary,
     }
     if verbose:
         print("pysim: done, %d agents, %d completed"
