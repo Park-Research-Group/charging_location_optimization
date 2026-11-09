@@ -3,8 +3,11 @@
 # (RealTimeRouting.cpp). One step = 0.1 min (6 s), five stages per step:
 # generation, loading buffer, entrance->exit transfer, capacities with
 # merge distribution, node transfer; then per-step statistics.
+import math
+
 import numpy as np
 
+from .charging import KM_PER_MILE
 from .cpp import ProgramStop, f32, floating_less, less_eq
 from .network import VehicleLink
 from .sp import SPNetwork, find_best_path
@@ -21,7 +24,15 @@ class Simulator:
         # current (prevailing) information at the loading start time
         self.prevailing_net = SPNetwork(world, use_prevailing=True,
                                         current_time=world.start)
+        # Free-flow network (iteration 0): fftt never changes during
+        # loading, so the charging engine reuses it for en-route
+        # charger searches instead of rebuilding it per leg.
+        self.ff_net = None
         self.td_map = {}
+        # Agent ids parked at en-route chargers (slice 3a), in park
+        # order. step() resumes them before stage 0; _discharge_link
+        # appends when a vehicle parks.
+        self.parked_ids = []
 
     # ----- iteration 0 of the agent-based driver -----
 
@@ -31,6 +42,66 @@ class Simulator:
         # shortest path on the physical network; preassigned paths are kept.
         world = self.world
         net = SPNetwork(world, use_prevailing=False)
+        self.ff_net = net
+        engine = getattr(world, "charging_engine", None)
+        if engine is not None:
+            engine.ff_net = net
+        if world.tour_mode:
+            # Per leg: buckets keyed by (leg origin zone, interval of
+            # the leg's scheduled departure). Paths land on the leg,
+            # never on the vehicle's working fields directly.
+            buckets = {}
+            for agent_id in world.vehicle_order:
+                veh = world.vehicles[agent_id]
+                for leg in veh.legs:
+                    zone_seq = world.zones[leg.origin_zone].seq_no
+                    interval = world.interval_index(leg.scheduled_departure)
+                    buckets.setdefault((zone_seq, interval), []).append(
+                        (veh, leg))
+            for key in sorted(buckets):
+                for veh, leg in buckets[key]:
+                    if veh.info_type == 0 and leg.node_size >= 2:
+                        continue
+                    if leg.origin_node == leg.dest_node:
+                        continue  # intrazonal: same node, instant leg
+                    world.gen_rng.ratio()  # pVeh->GetRandomRatio() draw
+                    if leg.node_size != 0:
+                        continue
+                    node_size, path_links, _ = find_best_path(
+                        world, net, leg.origin_zone, leg.origin_node,
+                        leg.scheduled_departure, leg.dest_zone,
+                        leg.dest_node, veh.demand_type, veh.vot)
+                    if node_size >= 2:
+                        leg.node_size = node_size
+                        leg.link_ary = [VehicleLink(link_no)
+                                        for link_no in path_links]
+                        leg.link_ary.append(VehicleLink(65530))
+                        distance = f32(0)
+                        for link_no in path_links:
+                            distance = f32(distance +
+                                           world.links[link_no].length)
+                        leg.distance = distance
+            # A pathless leg between distinct nodes that still has no
+            # feasible path must fail loud: letting it through would
+            # complete it silently with no travel at all.
+            for agent_id in world.vehicle_order:
+                veh = world.vehicles[agent_id]
+                for leg in veh.legs:
+                    if leg.origin_node != leg.dest_node and \
+                            leg.node_size < 2:
+                        raise ProgramStop(
+                            "agent %d leg %d has no path from node %d "
+                            "to node %d"
+                            % (agent_id, leg.leg_index,
+                               world.nodes[leg.origin_node].number,
+                               world.nodes[leg.dest_node].number))
+            # Iteration-0 may just have given leg 0 a path; re-mirror
+            # so the vehicle's working fields match leg 0.
+            for agent_id in world.vehicle_order:
+                veh = world.vehicles[agent_id]
+                if veh.legs:
+                    veh.begin_leg(veh.legs[0])
+            return
         buckets = {}
         for agent_id in world.vehicle_order:
             veh = world.vehicles[agent_id]
@@ -63,7 +134,76 @@ class Simulator:
 
     # ----- real-time path adjustments -----
 
+    def _has_pending_charger_stop(self, veh):
+        # True while the current leg's en-route stop has not been
+        # reached (or cancelled): the via path is a committed
+        # charging plan, so the built-in real-time adjustments
+        # must not re-plan it away. Once the stop is done the leg
+        # is an ordinary trip again.
+        if not veh.legs:
+            return False
+        stop = veh.legs[veh.current_leg].charger_stop
+        return stop is not None and not stop["done"]
+
+    def _build_via_path(self, veh, leg, site, links_to, links_from):
+        # Splice the en-route via path at generation (slice 3a):
+        # the free-flow links origin -> charger plus charger ->
+        # destination, replacing the direct path. The direct path
+        # is stored as the original path first, so output keeps
+        # both sequences. Distance and free-flow time are the via
+        # sums (the writer computes scheduled arrival from
+        # trip_fftt, so this keeps it correct); the planning
+        # energy on the leg stays the direct-path estimate. The
+        # decision already verified the site is viable, so a via
+        # path that fails validation here is an internal
+        # inconsistency and raises instead of falling back.
+        world = self.world
+        links = world.links
+        via = list(links_to) + list(links_from)
+        if not links_to or not links_from or \
+                links[via[0]].from_id != leg.origin_node or \
+                links[via[-1]].to_id != leg.dest_node:
+            raise ProgramStop(
+                "en-route via path for agent %d leg %d via charger "
+                "%s does not run from its origin to its destination"
+                % (veh.agent_id, leg.leg_index, site.charger_id))
+        for a, b in zip(via, via[1:]):
+            if links[a].to_id != links[b].from_id:
+                raise ProgramStop(
+                    "en-route via path for agent %d leg %d via "
+                    "charger %s is not a connected chain"
+                    % (veh.agent_id, leg.leg_index, site.charger_id))
+        if links[via[len(links_to) - 1]].to_id != site.node_id or \
+                links[via[len(links_to)]].from_id != site.node_id:
+            raise ProgramStop(
+                "en-route via path for agent %d leg %d does not "
+                "pass through charger %s"
+                % (veh.agent_id, leg.leg_index, site.charger_id))
+        self._store_original_path(veh)
+        veh.link_ary = [VehicleLink(link_no) for link_no in via]
+        veh.link_ary.append(VehicleLink(65530))
+        leg.link_ary = veh.link_ary
+        veh.node_size = len(via) + 1
+        leg.node_size = veh.node_size
+        distance = f32(0)
+        trip_fftt = f32(0)
+        for link_no in via:
+            distance = f32(distance + links[link_no].length)
+            trip_fftt = f32(trip_fftt + links[link_no].fftt)
+        veh.distance = distance
+        leg.distance = distance
+        veh.trip_fftt = trip_fftt
+        leg.trip_fftt = trip_fftt
+        leg.charger_stop = {"node": site.node_id, "site": site,
+                            "done": False,
+                            "target_soc": leg.decision_target_soc}
+
     def _store_original_path(self, veh):
+        # Keep the FIRST original: a later adjustment (e.g. an
+        # info-3 enroute_adjustment after a tow resume) must not
+        # overwrite the pre-tow original with the spliced path.
+        if veh.original_link_ary is not None:
+            return
         veh.original_link_ary = [
             VehicleLink(entry.link_no) for entry in veh.link_ary]
         for new, old in zip(veh.original_link_ary, veh.link_ary):
@@ -72,6 +212,11 @@ class Simulator:
 
     def generation_adjustment(self, veh, current_time):
         # g_AgentBasedPathAdjustmentWithRealTimeInfo (RealTimeRouting.cpp:399)
+        # Skipped while an en-route charger stop is pending: the
+        # via path is a committed plan, and re-planning from the
+        # first link's to-node would silently drop the detour.
+        if self._has_pending_charger_stop(veh):
+            return
         world = self.world
         if veh.node_size >= 1 and veh.link_ary:
             current_link = veh.link_ary[veh.sim_link_seq].link_no
@@ -118,6 +263,11 @@ class Simulator:
     def enroute_adjustment(self, veh, current_time):
         # g_OpenMPAgentBasedPathAdjustmentWithRealTimeInfo
         # (RealTimeRouting.cpp:649), VMS detour branch inert (no signs)
+        # Skipped while an en-route charger stop is pending, for the
+        # same reason as generation_adjustment: re-planning to the
+        # destination from here would drop the charger detour.
+        if self._has_pending_charger_stop(veh):
+            return
         world = self.world
         current_link = veh.link_ary[veh.sim_link_seq].link_no
         starting_node = world.links[current_link].to_id
@@ -246,18 +396,29 @@ class Simulator:
             if time_int in world.original_td_map:
                 self.td_map[time_int] = list(world.original_td_map[time_int])
             step += 1
-        # Early-exit bookkeeping. n_generatable counts, once, the vehicles
-        # that can ever be generated and completed: stage 0 loads only
-        # vehicles with node_size >= 2, and node_size is final at this
-        # point (iteration-0 assignment already ran; the real-time
-        # adjustments rewrite only loaded or in-transit vehicles and keep
-        # node_size >= 2, so nothing can join the generatable set later).
-        # The count is therefore exact for the generated set and a superset
-        # of the completed set: a counted vehicle that never completes
-        # (permanent gridlock) simply keeps the break from firing.
+        # Early-exit bookkeeping. n_generatable counts, once, every
+        # leg (tour mode) or vehicle (legacy) that can ever be
+        # generated and completed: stage 0 loads only node_size >= 2
+        # legs / vehicles, and node_size is final at this point
+        # (iteration-0 assignment already ran; the real-time
+        # adjustments rewrite only loaded or in-transit vehicles and
+        # keep node_size >= 2, so nothing can join the generatable
+        # set later). In tour mode every leg counts, including
+        # intrazonal instant legs: an instant leg starts and finishes
+        # atomically in stage 0, so it increments both generated and
+        # completed when it fires. Real legs increment generated at
+        # generation and completed at completion, as before. The
+        # count is therefore exact for the generated set and a
+        # superset of the completed set: a counted leg that never
+        # completes (permanent gridlock) simply keeps the break from
+        # firing, and generated == completed == n_generatable implies
+        # every leg started and finished.
         self.n_generatable = 0
         for agent_id in world.vehicle_order:
-            if world.vehicles[agent_id].node_size >= 2:
+            veh = world.vehicles[agent_id]
+            if veh.legs:
+                self.n_generatable += len(veh.legs)
+            elif veh.node_size >= 2:
                 self.n_generatable += 1
         self._early_exit_vetoed = False
         # Main loop: stops early once the network is drained (see the
@@ -278,7 +439,7 @@ class Simulator:
             # stage 5 has just written this minute's MOE from final flows
             # and the post-pass propagates those finals over the tail.
             # generated == completed == n_generatable: every generatable
-            # vehicle entered the network and reached its destination.
+            # leg / vehicle entered the network and reached its destination.
             if not self._early_exit_vetoed and time > world.end and \
                     step_no % 10 == 0 and \
                     self.generated == self.n_generatable and \
@@ -303,9 +464,14 @@ class Simulator:
 
     def _post_loading(self):
         world = self.world
-        # post-simulation tally (completed vehicles only): trip FFTT
+        # post-simulation tally (completed vehicles only): trip FFTT.
+        # Tour vehicles are skipped: each leg's trip_fftt was set at
+        # leg completion, and the last leg's links must not overwrite
+        # the earlier legs' values.
         for agent_id in world.vehicle_order:
             veh = world.vehicles[agent_id]
+            if veh.legs:
+                continue
             if not veh.complete:
                 continue
             veh.trip_fftt = f32(0)
@@ -313,12 +479,274 @@ class Simulator:
                 link = world.links[veh.link_ary[j].link_no]
                 veh.trip_fftt = f32(veh.trip_fftt + link.fftt)
 
+    def _schedule_next_leg(self, veh, leg, current_time,
+                           simulation_time_no):
+        # A leg just completed: start the next one, or finish the tour.
+        # Dwell legs leave arrival_actual + dwell_min after the leg
+        # just finished (delays cascade); fixed legs leave at their
+        # scheduled departure, or at arrival if that is later (a late
+        # arrival can push a fixed departure, never pull it earlier).
+        # The next leg is generated from its own departure bucket;
+        # a bucket at or before this step's bucket never fires again,
+        # so it is pushed to the next bucket.
+        if veh.current_leg + 1 < len(veh.legs):
+            veh.current_leg += 1
+            nxt = veh.legs[veh.current_leg]
+            if nxt.departure_mode == "dwell":
+                d_next = float(leg.arrival_actual) + float(nxt.dwell_min)
+            else:
+                d_next = max(float(nxt.scheduled_departure),
+                             float(leg.arrival_actual))
+            veh.begin_leg(nxt)
+            veh.departure = f32(d_next)
+            veh.loaded = False
+            veh.complete = False
+            key = int(f32(d_next * f32(10)))
+            if key <= simulation_time_no:
+                key = simulation_time_no + 1
+            self.td_map.setdefault(key, []).append(veh.agent_id)
+            return d_next
+        else:
+            veh.complete = True
+            return None
+
+    def _deduct_link_energy(self, veh, leg, link):
+        # Per-link SoC deduction (slice 3a): the energy of the link
+        # just completed comes off the vehicle's charge now, so a
+        # mid-leg path change (reroute, info adjustment) deducts
+        # the links actually travelled, not the planned path.
+        # Non-EVs and legacy vehicles (soc_kwh None) skip. The
+        # first link that would drive SoC below zero strands the
+        # leg at that link's to-node and clamps SoC to 0; later
+        # links deduct nothing further (soc stays 0). Stranded is
+        # the permanent record (once stranded, always flagged);
+        # depleted is the live suppression flag, keyed off here
+        # instead of stranded: the tow charge (slice 4) clears
+        # depleted and restores SoC, so deduction resumes after
+        # the tow while the leg stays flagged stranded. A stop
+        # the vehicle strands before reaching is cancelled here:
+        # it is marked done without charging and no event is
+        # recorded -- including a stranding on the link INTO the
+        # stop node: the vehicle never reached the charger, so
+        # there is nothing to charge from. Dust-level negatives
+        # (within 1e-9 kWh, float rounding on an exactly-depleting
+        # leg) clamp to 0 without stranding, so an exact-0 arrival
+        # at the stop still charges normally.
+        if veh.soc_kwh is None:
+            return
+        params = self.world.ev_params(veh)
+        if params is None:
+            return
+        if leg is not None and leg.depleted:
+            return
+        _battery, consumption = params
+        use = float(link.length) * KM_PER_MILE * consumption
+        remaining = veh.soc_kwh - use
+        if remaining < -1e-9:
+            veh.soc_kwh = 0.0
+            if leg is not None:
+                leg.stranded = True
+                leg.depleted = True
+                leg.stranding_count += 1
+                leg.stranded_node = \
+                    self.world.nodes[link.to_id].number
+                stop = leg.charger_stop
+                if stop is not None and not stop["done"]:
+                    stop["done"] = True
+        elif remaining < 0:
+            veh.soc_kwh = 0.0
+        else:
+            veh.soc_kwh = remaining
+
+    def _try_tow(self, veh, leg, link, arrival, travel_time):
+        # Tow for a vehicle that just stranded on this link (slice
+        # 4): the tow truck takes it to the nearest charger, it
+        # charges there, and it resumes driving to the leg's
+        # original destination. Returns True when the vehicle was
+        # towed (it leaves the exit queue here and is parked until
+        # the charge end); False when there is no tow, in which
+        # case the caller lets it continue in traffic as before
+        # (stranded, SoC 0, leg completes). No tow when there is
+        # no engine (no charger file / charging=False), when the
+        # leg has already been towed 3 times (cap against an
+        # infinite tow loop on a pathological leg), or when the
+        # engine finds no viable tow. The link departure is
+        # counted exactly as a normal move. The tow blockage
+        # window is recorded only (see README): other vehicles
+        # are not delayed by the tow truck in v1.
+        engine = getattr(self.world, "charging_engine", None)
+        if engine is None or leg.tow_count >= 3:
+            return False
+        stranded_time = float(arrival)
+        if travel_time < link.fftt:
+            stranded_time += float(link.fftt - travel_time)
+        plan = engine.tow_vehicle(self.world, veh, leg, link.to_id,
+                                  stranded_time, link)
+        if plan is None:
+            return False
+        world = self.world
+        links = world.links
+        travelled = [entry.link_no
+                     for entry in veh.link_ary[:veh.sim_link_seq + 1]]
+        stamps = [entry.abs_arrival
+                  for entry in veh.link_ary[:veh.sim_link_seq + 1]]
+        if veh.original_link_ary is None:
+            self._store_original_path(veh)
+        combined = travelled + list(plan["path_from_links"])
+        veh.node_size = len(combined) + 1
+        veh.link_ary = []
+        distance = f32(0)
+        trip_fftt = f32(0)
+        for i, link_no in enumerate(combined):
+            entry = VehicleLink(link_no)
+            entry.abs_arrival = stamps[i] if i < len(stamps) \
+                else f32(0)
+            veh.link_ary.append(entry)
+            distance = f32(distance + links[link_no].length)
+            trip_fftt = f32(trip_fftt + links[link_no].fftt)
+        veh.link_ary.append(VehicleLink(65530))
+        veh.distance = distance
+        veh.trip_fftt = trip_fftt
+        # The resume reuses the parked-vehicle machinery (step()):
+        # the vehicle re-enters the first charger->dest link's
+        # loading buffer at the charge end. The new link_ary is
+        # disconnected by design -- the jump from the stranded
+        # node to the charger node is the tow -- and the writer
+        # shows it in path_node_sequence from leg.tow_hops. When
+        # the charger is at the destination there is no link left
+        # to drive (path_from_links is empty), so there is no next
+        # link: the resume completes the leg at the charge end.
+        leg.tow_hops.append(
+            (len(travelled), plan["site"].node_number,
+             plan["arrival_charger"]))
+        veh.parked = {"resume_time": plan["charge_end"],
+                      "next_link_index": len(travelled)
+                      if plan["path_from_links"] else None}
+        self.parked_ids.append(veh.agent_id)
+        veh.delay = f32(veh.delay + f32(travel_time - link.fftt))
+        link.exit_queue.popleft()
+        veh.soc_deducted_seq = -1
+        link.cflow_departure += 1
+        link.departure_count += 1
+        link.departure_based_tt = f32(
+            link.departure_based_tt + travel_time)
+        leg.tow = True
+        leg.tow_count += 1
+        leg.depleted = False
+        veh.soc_kwh = plan["target_kwh"]
+        return True
+
+    def _complete_leg(self, veh, current_time, step_no):
+        # Destination reached: snapshot the leg, count the leg
+        # completion, and schedule the next leg (or finish the
+        # tour). Intermediate legs do not count as vehicle
+        # completions: veh.complete is cleared again by
+        # _schedule_next_leg, and only the last leg leaves it
+        # True. Energy was already deducted per link as the leg
+        # travelled (slice 3a), so soc_end is the vehicle's
+        # current charge and the stranded flag/node were set at
+        # the crossing link; nothing is deducted again here.
+        leg = veh.legs[veh.current_leg]
+        veh.finish_leg(leg)
+        params = self.world.ev_params(veh)
+        if params is not None:
+            leg.soc_end_kwh = veh.soc_kwh \
+                if veh.soc_kwh is not None else leg.soc_start_kwh
+            veh.soc_kwh = leg.soc_end_kwh
+        else:
+            leg.soc_start_kwh = 0.0
+            leg.soc_end_kwh = 0.0
+            leg.stranded = False
+        self.completed += 1
+        simulation_time_no = int(current_time + 0.0001) * 10 + step_no % 10
+        d_next = self._schedule_next_leg(veh, leg, current_time,
+                                         simulation_time_no)
+        engine = getattr(self.world, "charging_engine", None)
+        if engine is not None:
+            # Dwell charging runs after the next departure is known
+            # (so the window is known) and after the leg's energy
+            # was deducted per link. Stranded legs are recorded but
+            # never dwell-charged: an untowed one never reached its
+            # destination, and a towed one already charged at the
+            # tow charger (the stranded flag stays set, so the tow
+            # charge is not topped up here). Charging updates
+            # veh.soc_kwh, so the next leg's starting charge (mirrored
+            # by _schedule_next_leg before the charge) is re-synced.
+            if leg.stranded:
+                engine.record_stranded(self.world, veh, leg)
+            elif leg.decision == "destination":
+                engine.apply_destination_charge(
+                    self.world, veh, leg, float(leg.arrival_actual),
+                    d_next)
+            if not veh.complete and veh.legs and \
+                    veh.current_leg < len(veh.legs):
+                veh.legs[veh.current_leg].soc_start_kwh = veh.soc_kwh
+
     # ----- one simulation step -----
 
     def step(self, current_time, step_no):
         world = self.world
         links = world.links
         time_stamp = int(current_time + 0.0001)
+
+        # Resume vehicles parked at en-route chargers (slice 3a),
+        # before stage 0: a vehicle whose charge has finished
+        # re-enters the next link's loading buffer with a stamp of
+        # its resume time plus that link's free-flow time, exactly
+        # as stage 0 stamps a generated vehicle. sim_link_seq
+        # points at the next link (never reset to 0), generated is
+        # not incremented, and the decision is not re-run: the leg
+        # never stopped being in progress. The loading-buffer ->
+        # entrance-queue -> exit-queue flow then carries it, and
+        # when the next link discharges it, link_ary[sim_link_seq]
+        # is that link.
+        if self.parked_ids:
+            still_parked = []
+            for agent_id in self.parked_ids:
+                veh = world.vehicles.get(agent_id)
+                if veh is None or veh.parked is None:
+                    continue
+                if veh.parked["resume_time"] > current_time:
+                    still_parked.append(agent_id)
+                    continue
+                resume_time = veh.parked["resume_time"]
+                next_index = veh.parked["next_link_index"]
+                if next_index is None:
+                    # Towed to the destination charger (slice 4):
+                    # no links left to drive, so the leg completes
+                    # at the charge end, as if the vehicle had
+                    # driven its last link to the destination.
+                    # trip_fftt is the driven links only, as the
+                    # destination branch recomputes it.
+                    veh.arrival = f32(resume_time)
+                    veh.trip_time = f32(resume_time - veh.departure)
+                    veh.travel_time = f32(
+                        resume_time - veh.leaving_buffer_time)
+                    veh.sim_link_seq = len(veh.link_ary) - 1
+                    veh.complete = True
+                    veh.trip_fftt = f32(0)
+                    for j in range(veh.node_size - 1):
+                        veh.trip_fftt = f32(
+                            veh.trip_fftt +
+                            links[veh.link_ary[j].link_no].fftt)
+                    veh.parked = None
+                    if veh.legs:
+                        self._complete_leg(veh, resume_time, step_no)
+                    else:
+                        self.completed += 1
+                    continue
+                next_link = links[veh.link_ary[next_index].link_no]
+                next_node_number = -1
+                if next_index + 1 < veh.node_size - 1:
+                    after = links[
+                        veh.link_ary[next_index + 1].link_no]
+                    next_node_number = world.nodes[after.to_id].number
+                next_link.loading_buffer.append(
+                    [agent_id, next_node_number,
+                     f32(resume_time + next_link.fftt)])
+                veh.sim_link_seq = next_index
+                veh.parked = None
+            self.parked_ids = still_parked
 
         # information updating block (before generation)
         if world.info_updating_flag and \
@@ -348,6 +776,95 @@ class Simulator:
             veh = world.vehicles.get(agent_id)
             if veh is None or veh.loaded:
                 continue
+            if veh.legs:
+                leg = veh.legs[veh.current_leg]
+                if leg.origin_node == leg.dest_node:
+                    # Intrazonal instant leg: completes now, with no
+                    # loading buffer and no SoC change. It starts and
+                    # finishes atomically, so it counts as both
+                    # generated and completed. Its departure and
+                    # arrival are the step time it was generated.
+                    leg.departure_actual = current_time
+                    leg.arrival_actual = current_time
+                    leg.leaving_buffer_time = f32(current_time)
+                    leg.trip_fftt = 0.0
+                    leg.delay = 0.0
+                    leg.distance = f32(0)
+                    leg.complete = True
+                    veh.arrival = f32(current_time)
+                    veh.trip_time = f32(0)
+                    if world.ev_params(veh) is not None:
+                        leg.soc_start_kwh = veh.soc_kwh
+                        leg.soc_end_kwh = veh.soc_kwh
+                    else:
+                        leg.soc_start_kwh = 0.0
+                        leg.soc_end_kwh = 0.0
+                    self.generated += 1
+                    self.completed += 1
+                    self._schedule_next_leg(veh, leg, current_time,
+                                            simulation_time_no)
+                    continue
+                if leg.node_size < 2:
+                    # No feasible path between distinct nodes:
+                    # iteration-0 assignment raises for these, so
+                    # this is unreachable. Skip it without
+                    # generating, completing, or counting it.
+                    continue
+            if veh.legs:
+                # The leg begins travel now: make its pre-trip
+                # charging decision (path known, charge known) before
+                # it enters the loading buffer. Instant legs return
+                # above, so only travelling legs decide. An en-route
+                # decision splices the via path here, before the
+                # vehicle enters the loading buffer: the direct path
+                # is stored as the original path, and the leg's
+                # planning energy stays the direct-path estimate.
+                # Before the splice, the stay-and-finish check may
+                # keep the vehicle at its origin charger instead:
+                # it re-schedules the leg for the stay end and the
+                # leg is not generated on this step (veh.loaded
+                # stays False), so the computation append below must
+                # not run for it either.
+                engine = getattr(world, "charging_engine", None)
+                if engine is not None:
+                    leg = veh.legs[veh.current_leg]
+                    decision, site, _target = engine.decide_for_leg(
+                        world, veh, leg)
+                    if decision == "enroute":
+                        stay_end = engine.try_stay_and_finish(
+                            world, veh, leg, float(veh.departure))
+                        if stay_end is not None:
+                            veh.departure = f32(stay_end)
+                            leg.soc_start_kwh = veh.soc_kwh
+                            # Ceil, not floor: the leg is generated
+                            # at the first step at or after the stay
+                            # end, so it never departs before the
+                            # charge it was credited has finished
+                            # (floor let it leave up to 0.1 min early
+                            # with the full target charge). The
+                            # epsilon keeps float noise in stay_end
+                            # from pushing an exact step boundary one
+                            # bucket late.
+                            key = int(math.ceil(stay_end * 10 - 1e-6))
+                            if key <= simulation_time_no:
+                                key = simulation_time_no + 1
+                            self.td_map.setdefault(key, []).append(
+                                veh.agent_id)
+                            continue
+                    # After the stay resolution (stay or not), the
+                    # leg's starting charge is the vehicle's charge
+                    # before it enters the network.
+                    leg.soc_start_kwh = veh.soc_kwh
+                    if decision == "enroute":
+                        if site is None or leg.enroute_via is None:
+                            raise ProgramStop(
+                                "agent %d leg %d decided en-route "
+                                "with no charger or via path"
+                                % (veh.agent_id, leg.leg_index))
+                        links_to, links_from, _via_time = \
+                            leg.enroute_via
+                        self._build_via_path(veh, leg, site, links_to,
+                                             links_from)
             if veh.info_type in (2, 3):
                 computation.append(veh)
             if veh.node_size >= 2:
@@ -362,6 +879,13 @@ class Simulator:
                 veh.loaded = True
                 veh.sim_link_seq = 0
                 self.generated += 1
+                if veh.legs:
+                    # The leg begins travel now: record its actual
+                    # departure (the generation step time). Its
+                    # starting charge was set in begin_leg and does
+                    # not change while waiting at a node.
+                    leg = veh.legs[veh.current_leg]
+                    leg.departure_actual = current_time
         for veh in computation:
             self.generation_adjustment(veh, current_time)
 
@@ -386,7 +910,14 @@ class Simulator:
                     veh = world.vehicles[item[0]]
                     link.counts_demand[veh.demand_type] += 1
                     link.counts_vtype[veh.vehicle_type] += 1
-                    veh.leaving_buffer_time = f32(current_time)
+                    # Only the leg's first link stamps the buffer
+                    # exit: a parked resume (en-route park, tow)
+                    # re-enters here with sim_link_seq > 0, and
+                    # overwriting would corrupt the leg's
+                    # path_time_sequence first stamp and
+                    # veh.travel_time with the resume time.
+                    if veh.sim_link_seq == 0:
+                        veh.leaving_buffer_time = f32(current_time)
                     link.buffer_waiting_time = f32(
                         float(link.buffer_waiting_time) +
                         (current_time - float(veh.departure)))
@@ -504,11 +1035,11 @@ class Simulator:
             count = 0
             while count < size:
                 link = links[incoming[sequence]]
-                self._discharge_link(link, node, current_time)
+                self._discharge_link(link, node, current_time, step_no)
                 count += 1
                 sequence = (sequence + 1) % size
 
-    def _discharge_link(self, link, node, current_time):
+    def _discharge_link(self, link, node, current_time, step_no):
         world = self.world
         links = world.links
         vehicle_out_count = link.link_out_capacity
@@ -550,6 +1081,36 @@ class Simulator:
                 travel_time = f32(arrival - veh.link_ary[seq - 1].abs_arrival)
             else:
                 travel_time = f32(arrival - veh.departure)
+            # Per-link SoC deduction (slice 3a): the link just
+            # completed, before any stop check or move, so the
+            # charge at a charger stop sees the post-link SoC and
+            # the destination branch below deducts this link too.
+            # Deducted once per link: a vehicle blocked on its
+            # next link stays in the exit queue and is retried
+            # next step, so soc_deducted_seq records the link
+            # already charged for and the retry deducts nothing;
+            # every committed pop below clears it again. The
+            # deduction itself stays here, ahead of the stop
+            # check, so a stranding on the link into the stop
+            # still cancels the stop before charge_enroute runs.
+            leg = veh.legs[veh.current_leg] if veh.legs else None
+            was_depleted = leg.depleted if leg is not None else False
+            if veh.soc_deducted_seq != seq:
+                self._deduct_link_energy(veh, leg, link)
+                veh.soc_deducted_seq = seq
+            # Tow (slice 4): a vehicle that just stranded mid-leg
+            # stops here instead of continuing in traffic on empty.
+            # Only a fresh stranding on this link tows (a blocked
+            # retry re-enters with depleted already set, so the tow
+            # is attempted once), and only mid-leg: a stranding on
+            # the last link has already reached the destination and
+            # completes below. _try_tow returns False when towing
+            # is unavailable, and the vehicle continues as before.
+            if leg is not None and leg.depleted and not was_depleted \
+                    and seq < number_of_links - 1 and \
+                    self._try_tow(veh, leg, link, arrival, travel_time):
+                vehicle_out_count -= 1
+                continue
             if seq < number_of_links - 1:
                 # Mid-run reroute hook (charging fork): the vehicle has
                 # just completed this link and is at its to-node. A
@@ -570,11 +1131,49 @@ class Simulator:
                         number_of_links = veh.node_size - 1
                         rerouted = True
                 next_link = links[veh.link_ary[seq + 1].link_no]
+                minimum = link.fftt
+                if travel_time < minimum:
+                    arrival = f32(arrival + f32(minimum - travel_time))
+                    travel_time = minimum
+                # En-route charger stop (slice 3a): the vehicle
+                # just completed the link into its stop node. The
+                # engine charges it (or finds it already at/above
+                # its target, in which case it drives through and
+                # the stop is simply marked done). A charge parks
+                # the vehicle: it leaves the exit queue, enters no
+                # link, and resumes from the parked list at the
+                # charge end time. The completed link's departure
+                # is counted as in a normal move; the dwell itself
+                # is not added to veh.delay here, but it lands in
+                # the post-stop link's travel time when that link
+                # discharges (its arrival minus this link's
+                # abs_arrival spans the park), and veh.delay is
+                # write-only in this build (copied to leg.delay,
+                # never read), so that is only a reporting note.
+                if leg is not None and leg.charger_stop is not None \
+                        and not leg.charger_stop["done"] and \
+                        link.to_id == leg.charger_stop["node"]:
+                    engine = getattr(world, "charging_engine", None)
+                    if engine is not None:
+                        end = engine.charge_enroute(
+                            world, veh, leg, float(arrival))
+                        if end is not None:
+                            veh.delay = f32(
+                                veh.delay +
+                                f32(travel_time - link.fftt))
+                            veh.parked = {
+                                "resume_time": end,
+                                "next_link_index": seq + 1}
+                            self.parked_ids.append(veh.agent_id)
+                            link.exit_queue.popleft()
+                            veh.soc_deducted_seq = -1
+                            link.cflow_departure += 1
+                            link.departure_count += 1
+                            link.departure_based_tt = f32(
+                                link.departure_based_tt + travel_time)
+                            vehicle_out_count -= 1
+                            continue
                 if next_link.link_in_capacity > 0:
-                    minimum = link.fftt
-                    if travel_time < minimum:
-                        arrival = f32(arrival + f32(minimum - travel_time))
-                        travel_time = minimum
                     veh.delay = f32(veh.delay +
                                     f32(travel_time - link.fftt))
                     veh.sim_link_seq = seq + 1
@@ -586,6 +1185,7 @@ class Simulator:
                         new_item[1] = world.nodes[next_next.to_id].number
                     next_link.entrance_queue.append(new_item)
                     link.exit_queue.popleft()
+                    veh.soc_deducted_seq = -1
                     next_link.cflow_arrival += 1
                     next_link.counts_demand[veh.demand_type] += 1
                     next_link.counts_vtype[veh.vehicle_type] += 1
@@ -628,5 +1228,9 @@ class Simulator:
                 link.departure_based_tt = f32(
                     link.departure_based_tt + travel_time)
                 link.exit_queue.popleft()
-                self.completed += 1
+                veh.soc_deducted_seq = -1
+                if veh.legs:
+                    self._complete_leg(veh, current_time, step_no)
+                else:
+                    self.completed += 1
             vehicle_out_count -= 1

@@ -39,7 +39,10 @@ def run_pysim(input_dir, output_dir, verbose=False, reroute_callback=None,
     default parameters; False disables it; a dict enables it with
     those parameters overriding the defaults. When it runs, three
     more files are written: output_charging.csv,
-    output_charger_summary.csv, and output_stranded.csv.
+    output_charger_summary.csv, and output_stranded.csv. On a tour
+    input it runs the inline engine instead (pre-trip decisions and
+    dwell charging) and also writes output_decisions.csv, listed
+    under outputs["decisions"].
 
     Returns a dict with the input/output dirs, the output paths, the
     agent counts, and the charging summary (or None). Raises ProgramStop
@@ -69,6 +72,9 @@ def run_pysim(input_dir, output_dir, verbose=False, reroute_callback=None,
             output_dir, "output_charger_summary.csv")
         outputs["stranded"] = os.path.join(output_dir,
                                            "output_stranded.csv")
+        if getattr(world, "charging_engine", None) is not None:
+            outputs["decisions"] = os.path.join(
+                output_dir, "output_decisions.csv")
     result = {
         "input_dir": input_dir,
         "output_dir": output_dir,

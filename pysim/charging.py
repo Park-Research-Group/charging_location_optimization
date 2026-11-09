@@ -15,9 +15,13 @@
 # Liao et al. 2023 and the Zenodo 7549847 dataset. The initial-SoC
 # rule, the charge-to targets, and the default consumption rate are
 # v1 assumptions, not the paper's: they are parameters, not findings.
+import heapq
 import os
 
 from .cpp import CsvParser, ProgramStop
+from .decision import decide_charging, find_enroute_charger, \
+    leg_free_flow_energy
+from .sp import SPNetwork, find_best_path
 
 KM_PER_MILE = 1.60934  # DTALite link lengths are in miles
 
@@ -28,6 +32,14 @@ DEFAULT_CONFIG = {
     "target_soc_slow": 1.0,      #   the threshold); slower chargers
     "fast_threshold_kw": 50,     #   fill to full
     "consumption_default": 0.18,  # kWh/km, v1 assumption
+    "enroute_margin_frac": 0.1,   # fraction of battery: an en-route
+    "home_power_kw": 11.0,        #   stop is considered when SoC is
+    # within this margin of the leg's energy need (v1 assumption);
+    # home dwell charging power in kW (v1 assumption, 11 kW tier)
+    "tow_dispatch_min": 30.0,     # minutes for the tow truck to reach
+    #   a stranded vehicle (v1 assumption)
+    "tow_target_soc": 0.8,        # fraction of battery the tow charge
+    #   restores (v1 assumption)
 }
 
 
@@ -94,6 +106,581 @@ def _ev_params(world, veh):
     if consumption <= 0:
         consumption = DEFAULT_CONFIG["consumption_default"]
     return battery, consumption
+
+
+def stranding_point(world, leg, soc_start, consumption):
+    # Node number where a leg strands: walk its links accumulating
+    # energy from soc_start; the stranded node is the to-node of
+    # the first link whose cumulative use exceeds soc_start.
+    # None if the leg's energy never exceeds soc_start.
+    cumulative = 0.0
+    for entry in leg.link_ary[:-1]:
+        if entry.link_no == 65530:
+            continue
+        link = world.links[entry.link_no]
+        cumulative += float(link.length) * KM_PER_MILE * consumption
+        if cumulative > soc_start:
+            return world.nodes[link.to_id].number
+    return None
+
+
+def _site_target_frac(site, cfg):
+    return cfg["target_soc_fast"] \
+        if site.power_kw >= cfg["fast_threshold_kw"] \
+        else cfg["target_soc_slow"]
+
+
+def _distance_tree(world, origin_id):
+    # Single-source shortest path by link length in miles from
+    # origin_id (Dijkstra): (dist, pred_link); unreachable nodes
+    # keep dist inf and pred -1. No zone/connector filtering: the
+    # tow path is never driven in traffic (the vehicle jumps from
+    # the stranded node to the charger), so this only picks the
+    # nearest site and its tow travel time.
+    n = len(world.nodes)
+    dist = [float("inf")] * n
+    pred = [-1] * n
+    dist[origin_id] = 0.0
+    heap = [(0.0, origin_id)]
+    while heap:
+        d, node = heapq.heappop(heap)
+        if d > dist[node] + 1e-12:
+            continue
+        for link_no in world.nodes[node].outgoing:
+            link = world.links[link_no]
+            nd = d + float(link.length)
+            if nd < dist[link.to_id] - 1e-12:
+                dist[link.to_id] = nd
+                pred[link.to_id] = link_no
+                heapq.heappush(heap, (nd, link.to_id))
+    return dist, pred
+
+
+def _reconstruct_path(world, pred, origin_id, dest_id):
+    # Link list from origin to dest along pred links, or [] when
+    # origin == dest. pred comes from _distance_tree with a finite
+    # distance, so the walk always terminates at the origin.
+    links = []
+    node = dest_id
+    while node != origin_id:
+        link_no = pred[node]
+        if link_no < 0:
+            return []
+        links.append(link_no)
+        node = world.links[link_no].from_id
+    links.reverse()
+    return links
+
+
+class ChargingEngine:
+    # Inline charging for tour mode (slice 2): decisions are made
+    # pre-trip at leg generation and destination/home charging is
+    # applied during the dwell after a leg completes, bounded by
+    # the next leg's departure. En-route decisions are executed by
+    # slice 3a: generation splices the via path (loading.py) and
+    # the vehicle parks at the charger node to charge
+    # (charge_enroute, called from the loader). Lives in
+    # charging.py alongside the legacy post-pass so the writers
+    # and the site/queue state stay in one place.
+    def __init__(self, world, config=None):
+        cfg = dict(DEFAULT_CONFIG)
+        cfg.update(config or {})
+        self.config = cfg
+        self.world = world
+        self.sites, self.by_node = read_charger_sites(world)
+        self.events = []       # tour-mode tuples (15 fields)
+        self.home_events = []  # subset of events at HOME chargers
+        self.stranded = []     # tour-mode tuples (13 fields)
+        # Free-flow SP network, set by the Simulator from its
+        # iteration-0 net (fftt never changes during loading, so
+        # reuse is valid); created lazily on first use otherwise.
+        self.ff_net = None
+
+    def _ff_net(self):
+        if self.ff_net is None:
+            self.ff_net = SPNetwork(self.world, use_prevailing=False)
+        return self.ff_net
+
+    def _dest_site(self, leg):
+        sites = self.by_node.get(leg.dest_node)
+        return sites[0] if sites else None
+
+    @staticmethod
+    def _home_available(veh, leg):
+        return leg.trip_purpose == "home" and veh.home_charger == 1
+
+    def decide_for_leg(self, world, veh, leg):
+        # Pre-trip decision for a leg that is beginning travel.
+        # Stores the result on the leg (decision, charger id,
+        # target, and the planning energies) and returns it as
+        # (decision, site_or_None, target_soc_frac). Non-EVs get
+        # "none" with no computation.
+        params = world.ev_params(veh)
+        if params is None:
+            leg.decision = "none"
+            leg.decision_charger_id = ""
+            leg.decision_target_soc = 0.0
+            leg.decision_leg_energy_kwh = 0.0
+            leg.decision_remaining_kwh = 0.0
+            return ("none", None, 0.0)
+        battery, consumption = params
+        soc = leg.soc_start_kwh
+        leg_energy = leg_free_flow_energy(world, leg, consumption)
+        # Planning estimate: later legs' paths were assigned at
+        # iteration 0, so their free-flow energies are known now.
+        remaining = 0.0
+        for later in veh.legs[veh.current_leg:]:
+            remaining += leg_free_flow_energy(world, later, consumption)
+        dest_site = self._dest_site(leg)
+        home_available = self._home_available(veh, leg)
+        # SP queries are the expensive part (two per site), so the
+        # en-route search runs only when the leg may actually need
+        # it: SoC within the margin of the leg's energy need. The
+        # search returns the site plus its via path; the via path
+        # is stashed on the leg for generation to splice in
+        # (slice 3a) and cleared whenever no en-route stop applies.
+        enroute = None
+        enroute_via = None
+        margin = self.config.get("enroute_margin_frac", 0.1) * battery
+        if soc < leg_energy + margin:
+            found = find_enroute_charger(
+                world, self._ff_net(), veh, leg, soc, consumption,
+                leg.enroute_target_soc)
+            if found is not None:
+                enroute, links_to, links_from, via_time = found
+                enroute_via = (links_to, links_from, via_time)
+        leg.enroute_via = enroute_via
+        ctx = {
+            "soc_kwh": soc,
+            "leg_energy_kwh": leg_energy,
+            "remaining_energy_kwh": remaining,
+            "dest_site": dest_site,
+            "home_available": home_available,
+            "archetype": leg.archetype,
+            "enroute_target_soc": leg.enroute_target_soc,
+            "enroute_charger": enroute,
+            "battery_kwh": battery,
+            "config": self.config,
+        }
+        decision, site, target = decide_charging(world, veh, leg, ctx)
+        leg.decision = decision
+        if decision == "enroute":
+            leg.decision_charger_id = site.charger_id if site else ""
+        elif decision == "destination" and dest_site is None:
+            leg.decision_charger_id = "HOME"
+        elif decision == "destination" and site is not None:
+            leg.decision_charger_id = site.charger_id
+        else:
+            leg.decision_charger_id = ""
+        leg.decision_target_soc = target
+        leg.decision_leg_energy_kwh = leg_energy
+        leg.decision_remaining_kwh = remaining
+        return (decision, site, target)
+
+    def apply_destination_charge(self, world, veh, leg, arrival_time,
+                                 departure_next_or_None):
+        # Dwell charging for a leg whose decision is "destination",
+        # called after the next leg's departure is known. Window is
+        # [arrival_time, D_next) for non-terminal legs and
+        # [arrival_time, inf) for terminal legs. Stranded legs never
+        # reach their destination, so they are not charged here
+        # (the caller skips them); a leg already at/above its target
+        # records no event and counts as at-target. The at-target
+        # check comes before the plug-busy check: a vehicle that
+        # needs no charge needs no plug, so a busy plug cannot
+        # queue it out.
+        # Returns the outcome string, or None if nothing applies.
+        if leg.decision != "destination":
+            return None
+        params = world.ev_params(veh)
+        if params is None:
+            return None
+        battery, _consumption = params
+        soc_at_arrival = leg.soc_end_kwh
+        site = self._dest_site(leg)
+        home_available = self._home_available(veh, leg)
+        if site is not None:
+            charger_id = site.charger_id
+            power = site.power_kw
+            node_number = site.node_number
+            target_kwh = _site_target_frac(site, self.config) * battery
+            if target_kwh - soc_at_arrival <= 0:
+                leg.charge_outcome = "at-target"
+                return "at-target"
+            plug = min(range(site.plugs),
+                       key=lambda p: site.plug_free[p])
+            start = max(arrival_time, site.plug_free[plug])
+            if departure_next_or_None is not None and \
+                    start >= departure_next_or_None:
+                leg.charge_outcome = "queued-out"
+                return "queued-out"
+        elif home_available:
+            charger_id = "HOME"
+            power = self.config["home_power_kw"]
+            node_number = world.nodes[leg.dest_node].number
+            target_kwh = battery
+            if target_kwh - soc_at_arrival <= 0:
+                leg.charge_outcome = "at-target"
+                return "at-target"
+            plug = None
+            start = arrival_time
+            if departure_next_or_None is not None and \
+                    start >= departure_next_or_None:
+                leg.charge_outcome = "queued-out"
+                return "queued-out"
+        else:
+            return None
+        energy_needed = target_kwh - soc_at_arrival
+        time_needed = energy_needed / power * 60.0
+        if departure_next_or_None is None:
+            charge_time = time_needed
+        else:
+            charge_time = min(time_needed,
+                              departure_next_or_None - start)
+        if charge_time <= 0:
+            leg.charge_outcome = "queued-out"
+            return "queued-out"
+        energy = charge_time * power / 60.0
+        soc_after = soc_at_arrival + energy
+        end = start + charge_time
+        if plug is not None:
+            site.plug_free[plug] = end
+            leg.dwell_plug_index = plug
+        veh.soc_kwh = soc_after
+        leg.soc_end_kwh = soc_after
+        outcome = "charged-partial" if charge_time < time_needed \
+            else "charged-destination"
+        leg.charge_outcome = outcome
+        event = (veh.agent_id, veh.tour_id, charger_id, node_number,
+                 arrival_time, start - arrival_time, start, end,
+                 energy, soc_at_arrival, soc_after, power,
+                 leg.leg_index, 0, 0)
+        self.events.append(event)
+        if plug is not None:
+            # Keep the per-site event list in sync so the summary
+            # writer (which reads site.events) sees tour charges.
+            site.events.append(event)
+        if charger_id == "HOME":
+            self.home_events.append(event)
+        veh.last_dwell_charge = (charger_id, leg.dest_node, power,
+                                 soc_after, end)
+        return outcome
+
+    def try_stay_and_finish(self, world, veh, leg, d_next):
+        # Stay-and-finish check (slice 3b): prefer charging where
+        # the vehicle already is over detouring to an en-route
+        # charger. Runs at stage-0 generation, after decide_for_leg
+        # and before the via-path splice, only when the vehicle
+        # dwell-charged at this leg's origin node, the leg decided
+        # "enroute", and the leg is dwell-based (fixed legs never
+        # stay: they leave on schedule). Returns the stay end time
+        # when the vehicle stays, else None. The stay itself is
+        # applied here (plug, event, SoC); the caller re-schedules
+        # the leg for the stay end and does not generate it now.
+        # Queue estimate is 0 throughout: only the plug's own
+        # free time can delay the stay, never another vehicle.
+        if veh.last_dwell_charge is None or leg.decision != "enroute" \
+                or leg.departure_mode != "dwell":
+            return None
+        if veh.current_leg == 0 or leg.enroute_via is None:
+            return None
+        charger_id, node_id, power_here, _soc_after, _end = \
+            veh.last_dwell_charge
+        if node_id != leg.origin_node:
+            return None
+        params = world.ev_params(veh)
+        if params is None:
+            return None
+        battery, consumption = params
+        target_kwh = leg.decision_target_soc * battery
+        e_needed = max(0.0, target_kwh - veh.soc_kwh)
+        if e_needed <= 0:
+            return None
+        enroute_site = next(
+            (s for s in self.sites
+             if s.charger_id == leg.decision_charger_id), None)
+        if enroute_site is None:
+            return None
+        # The leg still holds its direct path here (the splice has
+        # not run), so the direct free-flow time and energy are
+        # read off it; the detour is via time minus direct time.
+        direct_time = 0.0
+        for entry in leg.link_ary[:-1]:
+            if entry.link_no == 65530:
+                continue
+            direct_time += float(world.links[entry.link_no].fftt)
+        _links_to, _links_from, via_time = leg.enroute_via
+        detour_time = via_time - direct_time
+        time_here = e_needed / power_here * 60.0
+        time_enroute = detour_time + \
+            e_needed / enroute_site.power_kw * 60.0
+        if time_here > time_enroute:
+            return None
+        # The stay must suffice to complete the leg: charging here
+        # to the target and then driving direct must be possible.
+        if leg_free_flow_energy(world, leg, consumption) > target_kwh:
+            return None
+        # Same plug the dwell charge used (the previous leg's); a
+        # HOME charge has no plug and starts at D_next.
+        prev_leg = veh.legs[veh.current_leg - 1]
+        if charger_id == "HOME":
+            site_here = None
+            plug = None
+            start = d_next
+        else:
+            site_here = next(
+                (s for s in self.sites if s.charger_id == charger_id),
+                None)
+            if site_here is None or prev_leg.dwell_plug_index is None:
+                return None
+            plug = prev_leg.dwell_plug_index
+            start = max(d_next, site_here.plug_free[plug])
+        stay_end = start + e_needed / power_here * 60.0
+        if stay_end - d_next > time_enroute:
+            return None
+        # Gate: tentative re-decision at the target charge, before
+        # applying anything. decide_for_leg reads the leg's
+        # starting charge, so both it and the vehicle's charge are
+        # set to the target for the call and the vehicle's charge
+        # is restored right after. A re-decision that is still
+        # "enroute" means the target sits within the en-route
+        # margin of the leg's need, so staying would not change
+        # the decision: restore the saved fields and do not stay.
+        saved = (leg.decision, leg.decision_charger_id,
+                 leg.decision_target_soc, leg.decision_leg_energy_kwh,
+                 leg.decision_remaining_kwh, leg.enroute_via)
+        soc_before = veh.soc_kwh
+        soc_start_before = leg.soc_start_kwh
+        veh.soc_kwh = target_kwh
+        leg.soc_start_kwh = target_kwh
+        redecision, _site, _target = self.decide_for_leg(
+            world, veh, leg)
+        veh.soc_kwh = soc_before
+        if redecision == "enroute":
+            (leg.decision, leg.decision_charger_id,
+             leg.decision_target_soc, leg.decision_leg_energy_kwh,
+             leg.decision_remaining_kwh, leg.enroute_via) = saved
+            leg.soc_start_kwh = soc_start_before
+            return None
+        # Apply the stay: take the plug, record a separate charging
+        # event against the previous leg (the dwell that is being
+        # extended), and move the charge to the target. The leg is
+        # not generated now; the caller re-schedules it.
+        if plug is not None:
+            site_here.plug_free[plug] = stay_end
+        node_number = world.nodes[node_id].number
+        event = (veh.agent_id, veh.tour_id, charger_id, node_number,
+                 d_next, start - d_next, start, stay_end, e_needed,
+                 soc_before, target_kwh, power_here,
+                 prev_leg.leg_index, 0, 0)
+        self.events.append(event)
+        if charger_id == "HOME":
+            self.home_events.append(event)
+        elif site_here is not None:
+            site_here.events.append(event)
+        veh.soc_kwh = target_kwh
+        leg.soc_start_kwh = target_kwh
+        veh.last_dwell_charge = (charger_id, node_id, power_here,
+                                 target_kwh, stay_end)
+        return stay_end
+
+    def charge_enroute(self, world, veh, leg, arrival_time):
+        # En-route charge at a stop the vehicle just reached
+        # (slice 3a, called from the loader when the vehicle
+        # completes the link into the stop node, after that link's
+        # energy was deducted). Returns the charge end time when
+        # the vehicle must park until then, or None when it drives
+        # through: the stop is marked done either way. A vehicle
+        # already at/above its target needs no charge and no plug,
+        # so a busy plug cannot hold it up. Otherwise the
+        # earliest-free plug is taken, the charge runs to the
+        # target (no dwell window bounds an en-route stop), and
+        # the event is recorded with charged_en_route = 1. The
+        # caller parks the vehicle until the returned end time and
+        # sets veh.soc_kwh to the target here: nothing reads SoC
+        # while it is parked.
+        stop = leg.charger_stop
+        site = stop["site"]
+        params = world.ev_params(veh)
+        battery, _consumption = params
+        soc_at_stop = veh.soc_kwh
+        target_kwh = stop["target_soc"] * battery
+        stop["done"] = True
+        if target_kwh - soc_at_stop <= 0:
+            return None
+        plug = min(range(site.plugs),
+                   key=lambda p: site.plug_free[p])
+        start = max(arrival_time, site.plug_free[plug])
+        energy_needed = target_kwh - soc_at_stop
+        charge_time = energy_needed / site.power_kw * 60.0
+        end = start + charge_time
+        site.plug_free[plug] = end
+        veh.soc_kwh = target_kwh
+        leg.charged_en_route = True
+        leg.enroute_plug_index = plug
+        event = (veh.agent_id, veh.tour_id, site.charger_id,
+                 site.node_number, arrival_time, start - arrival_time,
+                 start, end, energy_needed, soc_at_stop, target_kwh,
+                 site.power_kw, leg.leg_index, 1, 0)
+        self.events.append(event)
+        site.events.append(event)
+        return end
+
+    def tow_vehicle(self, world, veh, leg, stranded_node_id,
+                    stranded_time, stranded_link):
+        # Tow for a leg that stranded mid-leg (slice 4). Returns a
+        # plan dict, or None when there is no viable tow: no sites
+        # at all, no distance path from the stranded node to any
+        # site, or no free-flow path from the chosen site to the
+        # leg's destination. The nearest site is by free-flow
+        # DISTANCE (Dijkstra over link.length), not time; ties
+        # break toward higher power, then file order. A site at
+        # the destination node IS a tow destination for a stranded
+        # vehicle (it cannot drive there): the site->dest leg is
+        # trivially satisfied with no drive after charging, and
+        # the leg completes when the charge ends. The plan carries
+        # the charger->dest free-flow links (empty for a
+        # destination site), the charge end time, and the target
+        # charge; the caller (loading.py) splices the path, parks
+        # the vehicle until the charge end, and sets the tow
+        # flags. The charging records are made here: the tow
+        # charge event (tow_charge = 1, charged_en_route = 0) and
+        # the stranded row with its tow fields. Timeline (v1
+        # assumptions): the truck is dispatched at the stranding
+        # time T and reaches the vehicle at T + tow_dispatch_min
+        # (the blockage window on the stranded link); it tows
+        # along the distance-shortest path (travel_time_min of
+        # free-flow time) to the charger; the vehicle queues for
+        # the earliest-free plug and charges from 0 to
+        # tow_target_soc * battery at the site's power.
+        params = world.ev_params(veh)
+        if params is None:
+            return None
+        battery, consumption = params
+        dist, pred = _distance_tree(world, stranded_node_id)
+        ff_net = self._ff_net()
+        best = None
+        best_key = None
+        best_from = None
+        for idx, site in enumerate(self.sites):
+            d = dist[site.node_id]
+            if d == float("inf"):
+                continue
+            if site.node_id == leg.dest_node:
+                # Charger at the destination: the site->dest leg
+                # is trivially satisfied (no drive after charging),
+                # so the site is viable without a path search --
+                # find_best_path returns no path for origin == dest.
+                path_from = []
+            else:
+                site_zone = world.nodes[site.node_id].zone_id
+                node_size, path_from, _cost = find_best_path(
+                    world, ff_net, site_zone, site.node_id,
+                    int(stranded_time), leg.dest_zone, leg.dest_node,
+                    veh.demand_type, veh.vot)
+                if node_size < 2:
+                    continue
+            key = (d, -site.power_kw, idx)
+            if best_key is None or key < best_key:
+                best = site
+                best_key = key
+                best_from = path_from
+        if best is None:
+            return None
+        site = best
+        path_to = _reconstruct_path(world, pred, stranded_node_id,
+                                    site.node_id)
+        travel_time = sum(float(world.links[ln].fftt)
+                          for ln in path_to)
+        target_kwh = self.config["tow_target_soc"] * battery
+        tow_start = stranded_time + self.config["tow_dispatch_min"]
+        arrival_charger = tow_start + travel_time
+        plug = min(range(site.plugs),
+                   key=lambda p: site.plug_free[p])
+        start = max(arrival_charger, site.plug_free[plug])
+        charge_time = target_kwh / site.power_kw * 60.0
+        end = start + charge_time
+        site.plug_free[plug] = end
+        event = (veh.agent_id, veh.tour_id, site.charger_id,
+                 site.node_number, arrival_charger,
+                 start - arrival_charger, start, end, target_kwh,
+                 0.0, target_kwh, site.power_kw, leg.leg_index, 0, 1)
+        self.events.append(event)
+        site.events.append(event)
+        # Trip energy is the free-flow energy of the path as it
+        # stood at this stranding (the live path, which a reroute
+        # or an earlier tow may already have rewritten).
+        # soc_start_kwh is the LEG-START SoC (the charge at
+        # departure), not the charge at this stranding: a second
+        # stranding on the same leg repeats the leg-start value,
+        # not the tow-restored charge.
+        trip_energy = 0.0
+        for entry in veh.link_ary[:-1]:
+            if entry.link_no == 65530:
+                continue
+            link = world.links[entry.link_no]
+            trip_energy += float(link.length) * KM_PER_MILE \
+                * consumption
+        blockage = "%d->%d" % (
+            world.nodes[stranded_link.from_id].number,
+            world.nodes[stranded_link.to_id].number)
+        self.stranded.append(
+            (veh.agent_id, veh.tour_id,
+             world.nodes[stranded_node_id].number, trip_energy,
+             leg.soc_start_kwh, leg.leg_index, site.charger_id,
+             tow_start, end, target_kwh, blockage, stranded_time,
+             self.config["tow_dispatch_min"]))
+        leg.stranded_rows_recorded += 1
+        return {"site": site, "path_from_links": best_from,
+                "charge_end": end, "target_kwh": target_kwh,
+                "tow_start": tow_start,
+                "arrival_charger": arrival_charger}
+
+    def record_stranded(self, world, veh, leg):
+        params = world.ev_params(veh)
+        if params is None:
+            return
+        _battery, consumption = params
+        # A stranding already recorded by a tow needs no second
+        # row: tow_vehicle appends its row at tow time (with the
+        # tow fields), and this only covers strandings that have
+        # no row yet -- an untowed stranding, or a later stranding
+        # after the tow cap. The counters live on the leg:
+        # stranding_count rises at every crossing, and
+        # stranded_rows_recorded rises at every row written.
+        if leg.stranding_count <= leg.stranded_rows_recorded:
+            return
+        # Per-link deduction (slice 3a) already recorded the exact
+        # crossing node; the walk below is only a fallback for a
+        # stranded flag set before that deduction existed.
+        node = leg.stranded_node
+        if node is None:
+            node = stranding_point(world, leg, leg.soc_start_kwh,
+                                   consumption)
+        if node is None:
+            node = world.nodes[leg.dest_node].number
+        trip_energy = leg_free_flow_energy(world, leg, consumption)
+        # soc_start_kwh is the LEG-START SoC (see tow_vehicle):
+        # an untowed stranding after the tow cap repeats it too.
+        self.stranded.append((veh.agent_id, veh.tour_id, node,
+                              trip_energy, leg.soc_start_kwh,
+                              leg.leg_index, "", 0.0, 0.0, 0.0, "",
+                              0.0, 0.0))
+        leg.stranded_rows_recorded += 1
+
+    def finalize(self, world, output_dir):
+        _write_events(output_dir, self.events, tour=True)
+        _write_summary(world, output_dir, self.sites,
+                       home_events=self.home_events,
+                       home_power_kw=self.config["home_power_kw"])
+        _write_stranded(output_dir, self.stranded, tour=True)
+        _write_decisions(output_dir, world, self)
+        return {
+            "charges": len(self.events),
+            "stranded": len(self.stranded),
+            "sites": len(self.sites),
+            "total_energy_kwh": sum(e[8] for e in self.events),
+        }
 
 
 def run_charging(world, output_dir, config):
@@ -183,19 +770,29 @@ def run_charging(world, output_dir, config):
     return summary
 
 
-def _write_events(output_dir, events):
-    lines = ["agent_id,tour_id,charger_id,node_id,arrival_time_in_min,"
-             "wait_in_min,charge_start_in_min,charge_end_in_min,"
-             "energy_kwh,soc_before_kwh,soc_after_kwh,charger_power_kw\n"]
+def _write_events(output_dir, events, tour=False):
+    header = "agent_id,tour_id,charger_id,node_id,arrival_time_in_min," \
+        "wait_in_min,charge_start_in_min,charge_end_in_min," \
+        "energy_kwh,soc_before_kwh,soc_after_kwh,charger_power_kw"
+    if tour:
+        header += ",leg_index,charged_en_route,tow_charge"
+    lines = [header + "\n"]
     for e in events:
-        lines.append(
-            "%d,%d,%s,%d,%.2f,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.1f\n" % e)
+        if tour:
+            lines.append(
+                "%d,%d,%s,%d,%.2f,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.1f,"
+                "%d,%d,%d\n" % e)
+        else:
+            lines.append(
+                "%d,%d,%s,%d,%.2f,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.1f\n"
+                % e)
     with open(os.path.join(output_dir, "output_charging.csv"),
               "w", newline="", encoding="utf-8") as fh:
         fh.writelines(lines)
 
 
-def _write_summary(world, output_dir, sites):
+def _write_summary(world, output_dir, sites, home_events=None,
+                   home_power_kw=11.0):
     lines = ["charger_id,node_id,power_kw,plugs,kind,charges_served,"
              "total_energy_kwh,mean_wait_min,max_wait_min,"
              "max_queue_length,utilization\n"]
@@ -221,16 +818,83 @@ def _write_summary(world, output_dir, sites):
                site.plugs, site.kind, len(evs), total_energy,
                sum(waits) / len(waits) if waits else 0.0,
                max(waits) if waits else 0.0, max_queue, util))
+    if home_events:
+        # HOME row: home charging has no site node (0), no shared
+        # plugs and no queue. plugs is the number of distinct agents
+        # that home-charged; waits, max queue and utilization are
+        # rendered 0.0/0 by construction (see README).
+        agents = {e[0] for e in home_events}
+        total_energy = sum(e[8] for e in home_events)
+        lines.append(
+            "HOME,0,%.1f,%d,home,%d,%.3f,%.2f,%.2f,0,%.4f\n"
+            % (home_power_kw, len(agents), len(home_events),
+               total_energy, 0.0, 0.0, 0.0))
     with open(os.path.join(output_dir, "output_charger_summary.csv"),
               "w", newline="", encoding="utf-8") as fh:
         fh.writelines(lines)
 
 
-def _write_stranded(output_dir, stranded):
-    lines = ["agent_id,tour_id,stranded_node_id,trip_energy_kwh,"
-             "soc_start_kwh\n"]
+def _write_stranded(output_dir, stranded, tour=False):
+    header = "agent_id,tour_id,stranded_node_id,trip_energy_kwh," \
+        "soc_start_kwh"
+    if tour:
+        # Tow fields are empty / 0.0 when the leg was not towed.
+        header += ",leg_index,tow_charger_id,tow_start_in_min," \
+            "tow_end_in_min,charge_kwh,tow_blockage_link," \
+            "tow_blockage_start_in_min,tow_blockage_duration_min"
+    lines = [header + "\n"]
     for row in stranded:
-        lines.append("%d,%d,%d,%.3f,%.3f\n" % row)
+        if tour:
+            lines.append("%d,%d,%d,%.3f,%.3f,%d,%s,%.2f,%.2f,%.3f,"
+                         "%s,%.2f,%.2f\n" % row)
+        else:
+            lines.append("%d,%d,%d,%.3f,%.3f\n" % row)
     with open(os.path.join(output_dir, "output_stranded.csv"),
+              "w", newline="", encoding="utf-8") as fh:
+        fh.writelines(lines)
+
+
+def _write_decisions(output_dir, world, engine):
+    # One row per leg (vehicles by agent_id, legs by leg_index).
+    # Outcome precedence: stranded > queued-out > charged-partial >
+    # charged-destination > at-target > completed. day follows outputs.py: the
+    # actual departure when the leg departed, else the scheduled one.
+    lines = ["agent_id,leg_index,day,soc_at_departure_kwh,"
+             "leg_energy_kwh,remaining_energy_kwh,"
+             "destination_charger,decision,enroute_charger_id,"
+             "target_soc,outcome\n"]
+    for agent_id in sorted(world.vehicles):
+        veh = world.vehicles[agent_id]
+        for leg in sorted(veh.legs, key=lambda l: l.leg_index):
+            departed = leg.complete or leg.departure_actual is not None
+            actual_dep = leg.departure_actual if departed \
+                else float(leg.scheduled_departure)
+            day = int(actual_dep // 1440)
+            dest_charger = 1 if (engine.by_node.get(leg.dest_node)
+                                 or engine._home_available(veh, leg)) \
+                else 0
+            enroute_id = leg.decision_charger_id \
+                if leg.decision == "enroute" else ""
+            if leg.stranded:
+                outcome = "stranded"
+            elif leg.charge_outcome == "queued-out":
+                outcome = "queued-out"
+            elif leg.charge_outcome == "charged-partial":
+                outcome = "charged-partial"
+            elif leg.charge_outcome == "charged-destination":
+                outcome = "charged-destination"
+            elif leg.charge_outcome == "at-target":
+                outcome = "at-target"
+            else:
+                outcome = "completed"
+            lines.append(
+                "%d,%d,%d,%.3f,%.3f,%.3f,%d,%s,%s,%.3f,%s\n"
+                % (veh.agent_id, leg.leg_index, day,
+                   float(leg.soc_start_kwh),
+                   float(leg.decision_leg_energy_kwh),
+                   float(leg.decision_remaining_kwh), dest_charger,
+                   leg.decision, enroute_id,
+                   float(leg.decision_target_soc), outcome))
+    with open(os.path.join(output_dir, "output_decisions.csv"),
               "w", newline="", encoding="utf-8") as fh:
         fh.writelines(lines)

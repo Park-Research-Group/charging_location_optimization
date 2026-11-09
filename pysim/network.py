@@ -7,6 +7,7 @@ from collections import deque
 
 import numpy as np
 
+from .charging import DEFAULT_CONFIG
 from .cpp import (CsvParser, IniFile, LinkRNG, ProgramStop, VehicleGenerationRng,
                   WellRng, f32, parse_line)
 
@@ -137,6 +138,97 @@ class VehicleLink:
         self.abs_arrival = f32(99999)
 
 
+class Leg:
+    # One leg of a multi-leg tour: a single trip from one node to the
+    # next, with its own scheduled departure (fixed time, or a dwell
+    # after the previous leg's arrival). Travel state lives here per
+    # leg; Vehicle.begin_leg/finish_leg mirror it onto/from the
+    # vehicle's working fields while the leg is being simulated.
+    __slots__ = (
+        "leg_index", "origin_node", "dest_node", "origin_zone", "dest_zone",
+        "scheduled_departure", "departure_mode", "dwell_min",
+        "trip_purpose", "archetype", "enroute_target_soc",
+        "link_ary", "node_size", "original_link_ary", "original_node_size",
+        "distance", "departure_actual", "arrival_actual", "trip_fftt",
+        "delay", "soc_start_kwh", "soc_end_kwh", "complete", "stranded",
+        "tow", "charged_en_route", "leaving_buffer_time",
+        "decision", "decision_charger_id", "decision_target_soc",
+        "charge_outcome", "decision_leg_energy_kwh",
+        "decision_remaining_kwh", "charger_stop", "stranded_node",
+        "dwell_plug_index", "enroute_plug_index", "enroute_via",
+        "depleted", "tow_count", "stranding_count",
+        "stranded_rows_recorded", "tow_hops")
+
+    def __init__(self):
+        self.leg_index = 0
+        self.origin_node = 0
+        self.dest_node = 0
+        self.origin_zone = 0
+        self.dest_zone = 0
+        self.scheduled_departure = f32(0)
+        self.departure_mode = "fixed"
+        self.dwell_min = 0.0
+        self.trip_purpose = "other"
+        self.archetype = ""
+        self.enroute_target_soc = 0.8
+        self.link_ary = None
+        self.node_size = 0
+        self.original_link_ary = None
+        self.original_node_size = 0
+        self.distance = f32(0)
+        self.departure_actual = None
+        self.arrival_actual = 0.0
+        self.trip_fftt = 0.0
+        self.delay = 0.0
+        self.soc_start_kwh = 0.0
+        self.soc_end_kwh = 0.0
+        self.complete = False
+        self.stranded = False
+        self.tow = False
+        self.charged_en_route = False
+        self.leaving_buffer_time = f32(0)
+        self.decision = "none"
+        self.decision_charger_id = ""
+        self.decision_target_soc = 0.0
+        self.charge_outcome = ""
+        self.decision_leg_energy_kwh = 0.0
+        self.decision_remaining_kwh = 0.0
+        # En-route stop (slice 3a): {"node", "site", "done",
+        # "target_soc"} once generation splices the via path, else
+        # None. stranded_node is the node number where per-link
+        # deduction first drove SoC to zero, else None.
+        # dwell_plug_index / enroute_plug_index record which plug
+        # a dwell / en-route charge used (None when none was used);
+        # enroute_via holds (links_to, links_from, via_time_min)
+        # from the decision search until generation consumes it.
+        self.charger_stop = None
+        self.stranded_node = None
+        self.dwell_plug_index = None
+        self.enroute_plug_index = None
+        self.enroute_via = None
+        # Tow state (slice 4): stranded is the permanent record
+        # (once stranded, always flagged, for output); depleted is
+        # the live state that suppresses per-link deduction (set at
+        # the crossing, cleared by the tow charge when SoC is
+        # restored). tow_count caps re-tows at 3 per leg.
+        # stranding_count rises at every crossing and
+        # stranded_rows_recorded at every stranded row written, so
+        # record_stranded only covers strandings that have no row
+        # yet (a tow already writes its row at tow time).
+        self.depleted = False
+        self.tow_count = 0
+        self.stranding_count = 0
+        self.stranded_rows_recorded = 0
+        # Tow hops (slice 4): one (links_before, charger node
+        # number, tow arrival time) per tow, in tow order, so the
+        # writer can show the tow jump in path_node_sequence /
+        # path_time_sequence. links_before is the number of links
+        # travelled before the tow (the hop belongs right after
+        # that link); the arrival time is when the vehicle reaches
+        # the charger (stranding + dispatch + tow travel).
+        self.tow_hops = []
+
+
 class Vehicle:
     __slots__ = (
         "agent_id", "tour_id", "dependency_agent_id", "following_agent_id",
@@ -147,7 +239,9 @@ class Vehicle:
         "distance", "trip_fftt", "delay", "node_size", "link_ary",
         "original_link_ary", "original_node_size", "loaded", "complete",
         "sim_link_seq", "leaving_buffer_time", "time_to_retrieve_info",
-        "home_charger", "soc_start_kwh", "soc_end_kwh")
+        "home_charger", "soc_start_kwh", "soc_end_kwh",
+        "legs", "current_leg", "soc_kwh", "last_dwell_charge",
+        "parked", "soc_deducted_seq")
 
     def __init__(self, agent_id):
         self.agent_id = agent_id
@@ -184,6 +278,78 @@ class Vehicle:
         self.home_charger = 0
         self.soc_start_kwh = 0.0
         self.soc_end_kwh = 0.0
+        self.legs = []
+        self.current_leg = 0
+        self.soc_kwh = None
+        # (charger_id, node internal id, power_kw, soc_after_kwh,
+        # end_time) of the last dwell charge, or None: a hook for
+        # slice 3's stay-and-finish check. Set by
+        # ChargingEngine.apply_destination_charge.
+        self.last_dwell_charge = None
+        # Parked at an en-route charger (slice 3a): {"resume_time",
+        # "next_link_index"} while waiting out a charge, else None.
+        self.parked = None
+        # Link sequence already charged for by _discharge_link, or -1:
+        # a vehicle blocked on its next link is retried next step,
+        # and this stops the same link's energy being deducted once
+        # per retry. Cleared again on every committed pop.
+        self.soc_deducted_seq = -1
+
+    def begin_leg(self, leg):
+        # Mirror a leg's travel state onto the vehicle's working fields
+        # so the loading engine can simulate it as a single trip.
+        # Departure is the leg's scheduled departure; for later legs
+        # the loader overwrites it before generation.
+        self.origin_node = leg.origin_node
+        self.dest_node = leg.dest_node
+        self.origin_zone = leg.origin_zone
+        self.dest_zone = leg.dest_zone
+        self.departure = leg.scheduled_departure
+        self.link_ary = leg.link_ary
+        self.node_size = leg.node_size
+        # The original path is per leg: a new leg starts with no
+        # original path, so a reroute on an earlier leg cannot leak
+        # into this leg's output row.
+        self.original_link_ary = None
+        self.original_node_size = 0
+        self.distance = leg.distance
+        # The leg starts with the vehicle's current charge. SoC does
+        # not change while waiting at a node, so this is the value at
+        # generation for departed legs, and the carried charge for a
+        # leg that never departs.
+        leg.soc_start_kwh = self.soc_kwh \
+            if self.soc_kwh is not None else 0.0
+        self.sim_link_seq = 0
+        self.loaded = False
+        self.complete = False
+        self.arrival = f32(0)
+        self.trip_time = f32(0)
+        self.travel_time = f32(0)
+        self.delay = f32(0)
+        self.trip_fftt = f32(0)
+        self.leaving_buffer_time = f32(0)
+
+    def finish_leg(self, leg):
+        # Snapshot the vehicle's working fields back into the leg after
+        # simulation. SoC fields are not touched here; the loader sets
+        # those.
+        leg.link_ary = self.link_ary
+        leg.node_size = self.node_size
+        leg.original_link_ary = self.original_link_ary
+        leg.original_node_size = self.original_node_size
+        leg.distance = self.distance
+        # departure_actual is set at generation (the actual step time),
+        # which finish_leg must not overwrite with the scheduled
+        # departure held in veh.departure. It is None only when the leg
+        # was never generated; a leg generated at time 0.0 now keeps
+        # its real 0.0 instead of being mistaken for never-departed.
+        if leg.departure_actual is None:
+            leg.departure_actual = self.departure
+        leg.arrival_actual = self.arrival
+        leg.trip_fftt = self.trip_fftt
+        leg.delay = self.delay
+        leg.complete = self.complete
+        leg.leaving_buffer_time = self.leaving_buffer_time
 
 
 class DemandType:
@@ -260,6 +426,38 @@ class World:
         # vehicles follow their paths except for the built-in info-type
         # adjustments (see loading.py).
         self.reroute_callback = None
+        # Tour mode: True when the agent CSV carries a leg_index column,
+        # set per file in _read_agent_file. A file is either tour mode
+        # or legacy mode. _tour_prev_dest tracks the raw destination
+        # node number of each agent's last read leg, for the chaining
+        # check (raw file numbers, not resolved internal ids).
+        # _tour_mode_set records that a demand file has already fixed
+        # the mode: a later file of the other kind raises instead of
+        # silently loading tour legs that the legacy writer would drop.
+        # Inline charging engine (slice 2): set by run_loading when
+        # charging is enabled on a tour input, else None. The
+        # charging summary dict is filled after simulation.
+        self.charging_engine = None
+        self.charging_summary = None
+        self.tour_mode = False
+        self._tour_mode_set = False
+        self._tour_prev_dest = {}
+
+    def ev_params(self, veh):
+        # (battery_kwh, consumption_kwh_per_km) or None for non-EVs;
+        # mirrors charging._ev_params.
+        idx = veh.vehicle_type - 1
+        if idx < 0 or idx >= len(self.vehicle_type_is_electric):
+            return None
+        if not self.vehicle_type_is_electric[idx]:
+            return None
+        battery = self.vehicle_type_battery[idx]
+        consumption = self.vehicle_type_consumption[idx]
+        if battery <= 0:
+            return None
+        if consumption <= 0:
+            consumption = DEFAULT_CONFIG["consumption_default"]
+        return battery, consumption
 
     # ----- settings / scenario -----
 
@@ -289,7 +487,7 @@ class World:
                 if not ok:
                     raise ProgramStop(
                         "end_time_in_min missing in demand file list")
-                if rec_end > 2880 or rec_start < 0:
+                if rec_end > 20160 or rec_start < 0:
                     raise ProgramStop("demand loading period out of range")
                 start = min(start, rec_start)
                 end = max(end, rec_end)
@@ -320,21 +518,24 @@ class World:
         # g_ReadAssignmentPeriodSettings (DTALite.cpp:5900): uniform grid is
         # built first, then unconditionally overwritten by the absolute
         # 15-minute grid; the last interval closes at the loading end time.
+        # Arrays are sized to the horizon (a week run needs ~694 slots),
+        # not the old fixed 300.
         agg = max(1, self.aggregation_interval)
-        n1 = min(299, max(1, (self.horizon - self.start) // agg))
-        index = [0] * 300
-        starts = [0] * 300
-        ends = [0] * 300
+        n_slots = self.horizon // 15 + 2
+        n1 = min(n_slots - 1, max(1, (self.horizon - self.start) // agg))
+        index = [0] * n_slots
+        starts = [0] * n_slots
+        ends = [0] * n_slots
         for i in range(n1):
             index[self.start // agg + i] = i
             starts[i] = self.start + i * agg
             ends[i] = self.start + (i + 1) * agg
-        index = [0] * 300
-        if self.start // 15 < 300:
+        index = [0] * n_slots
+        if self.start // 15 < n_slots:
             index[self.start // 15] = 0
         starts[0] = self.start
         counter = 0
-        for i in range(300):
+        for i in range(n_slots):
             if i * 15 >= self.start and i * 15 < self.horizon:
                 if i * 15 != self.start:
                     counter += 1
@@ -353,7 +554,12 @@ class World:
             return 0
         if time_in_min < self.horizon:
             slot = max(0, int(f32(time_in_min) + 0.1) // 15)
-            value = self.assign_index[slot]
+            if slot < len(self.assign_index):
+                value = self.assign_index[slot]
+            else:
+                # Out-of-range slot (cannot happen with the sized grid,
+                # but never raise here): clamp to the last period.
+                value = max(0, self.num_periods - 1)
         else:
             value = max(0, self.num_periods - 1)
         return min(value, self.num_periods - 1)
@@ -790,16 +996,33 @@ class World:
         return vehicle_type, info_class, vot, age
 
     def _read_agent_file(self, file_name):
-        # g_ReadTripCSVFile (Agent.cpp:205) for one input agent csv
+        # g_ReadTripCSVFile (Agent.cpp:205) for one input agent csv.
+        # A file is either tour mode (header carries leg_index) or
+        # legacy mode (no leg_index column).
         parser = CsvParser(self._path(file_name))
+        file_tour_mode = "leg_index" in parser.field_index
+        if self._tour_mode_set and file_tour_mode != self.tour_mode:
+            raise ProgramStop(
+                "demand files mix tour and legacy agent formats: %s "
+                "is %s but earlier files are %s"
+                % (file_name,
+                   "tour mode" if file_tour_mode else "legacy mode",
+                   "tour mode" if self.tour_mode else "legacy mode"))
+        self.tour_mode = file_tour_mode
+        self._tour_mode_set = True
         line_no = 0
         while parser.read_record():
             if len(parser.fields) == 0:
                 break
             line_no += 1
             self._read_agent_record(parser, line_no)
+        if self.tour_mode:
+            for veh in self.vehicles.values():
+                veh.legs.sort(key=lambda leg: leg.leg_index)
 
     def _read_agent_record(self, parser, line_no):
+        if self.tour_mode:
+            return self._read_agent_record_tour(parser, line_no)
         ok, agent_id = parser.get("agent_id", "int", required=True)
         if not ok:
             raise ProgramStop("agent_id missing in agent file")
@@ -893,6 +1116,187 @@ class World:
             veh.node_size = 0
             veh.link_ary = None
         self._register(veh, is_new)
+
+    def _read_agent_record_tour(self, parser, line_no):
+        # Tour-mode record: a repeated agent_id appends a new Leg
+        # instead of overwriting the vehicle. Attribute columns
+        # (tour_id, demand_type, vehicle_type, information_type,
+        # value_of_time, vehicle_age, home_charger) are read from the
+        # leg-0 row and govern the vehicle; later leg rows may repeat
+        # them but leg 0 wins. The departure bucket registration
+        # happens only for leg 0.
+        ok, agent_id = parser.get("agent_id", "int", required=True)
+        if not ok:
+            raise ProgramStop("agent_id missing in agent file")
+        veh = self.vehicles.get(agent_id)
+        is_new = veh is None
+        ok, leg_index = parser.get("leg_index", "int", required=True)
+        if not ok:
+            raise ProgramStop("leg_index missing in agent file")
+        ok, mode = parser.get("departure_mode", "str", required=True)
+        if not ok or mode not in ("fixed", "dwell"):
+            raise ProgramStop(
+                "agent %d leg %d departure_mode must be fixed or dwell"
+                % (agent_id, leg_index))
+        ok, dwell = parser.get("dwell_min", "float")
+        dwell = float(dwell) if ok else 0.0
+        ok, purpose = parser.get("trip_purpose", "str")
+        purpose = purpose if ok else "other"
+        if purpose not in ("home", "work", "other"):
+            raise ProgramStop(
+                "agent %d leg %d trip_purpose must be home, work or other"
+                % (agent_id, leg_index))
+        ok, archetype = parser.get("archetype", "str")
+        archetype = archetype if ok else ""
+        ok, target = parser.get("enroute_target_soc", "float")
+        target = float(target) if ok else 0.8
+        ok, from_zone = parser.get("from_zone_id", "int", required=True)
+        if not ok:
+            return
+        ok, to_zone = parser.get("to_zone_id", "int", required=True)
+        if not ok:
+            return
+        if from_zone not in self.zones or to_zone not in self.zones:
+            return  # zone not defined: skip this leg (leg 0: no vehicle)
+        ok, from_node = parser.get("from_origin_node_id", "int",
+                                   required=True)
+        if not ok:
+            return
+        ok, to_node = parser.get("to_destination_node_id", "int",
+                                 required=True)
+        if not ok:
+            return
+        origin = self._node_or_zone_activity(
+            from_node, from_zone, agent_id, origin=True)
+        dest = self._node_or_zone_activity(
+            to_node, to_zone, agent_id, origin=False)
+        # departure_time_in_min is the scheduled departure, absolute
+        # minutes from week start; intrazonal legs are kept (the loader
+        # completes them instantly) so there is no intrazonal skip here.
+        ok, departure = parser.get("departure_time_in_min", "float",
+                                   required=True)
+        if not ok:
+            return
+        if departure < self.start or departure > self.end:
+            raise ProgramStop(
+                "agent %d departure %s outside loading window"
+                % (agent_id, float(departure)))
+        # Leg sequence: first leg must be 0, later legs contiguous and
+        # strictly ascending (so distinct), and each leg must chain
+        # from the previous leg's destination (raw file node numbers).
+        if is_new:
+            if leg_index != 0:
+                raise ProgramStop(
+                    "agent %d first leg must have leg_index 0" % agent_id)
+        else:
+            if not veh.legs or \
+                    leg_index != veh.legs[-1].leg_index + 1:
+                raise ProgramStop(
+                    "agent %d leg_index values must start at 0 and be "
+                    "contiguous" % agent_id)
+            if from_node != self._tour_prev_dest.get(agent_id):
+                raise ProgramStop(
+                    "agent %d leg %d does not chain from the previous leg"
+                    % (agent_id, leg_index))
+        if is_new:
+            veh = Vehicle(agent_id)
+            ok, tour_id = parser.get("tour_id", "int")
+            if ok and tour_id >= 0:
+                veh.tour_id = tour_id
+            ok, home = parser.get("home_charger", "int")
+            if ok and home >= 1:
+                veh.home_charger = 1
+            # Attribute block, as in legacy mode but leg 0 only.
+            ok, demand_type = parser.get("demand_type", "int")
+            if ok:
+                veh.demand_type = demand_type
+                vtype, info, vot, age = self._vehicle_attributes(
+                    demand_type)
+                veh.vehicle_type = vtype
+                veh.info_type = info
+                veh.vot = vot
+                veh.age = age
+                ok, file_vtype = parser.get("vehicle_type", "int",
+                                            required=True)
+                if ok and file_vtype >= 1:
+                    veh.vehicle_type = file_vtype
+                info_local = veh.info_type
+                ok, file_info = parser.get("information_type", "int",
+                                           required=True)
+                if ok:
+                    info_local = file_info
+                ok, file_vot = parser.get("value_of_time", "int",
+                                          required=True)
+                if ok and file_vot >= 1:
+                    veh.vot = f32(file_vot)
+                ok, file_age = parser.get("vehicle_age", "int",
+                                          required=True)
+                if ok:
+                    veh.age = file_age
+                veh.info_type = info_local
+            params = self.ev_params(veh)
+            if params is not None:
+                battery, _consumption = params
+                veh.soc_kwh = battery * (
+                    DEFAULT_CONFIG["initial_soc_home"]
+                    if veh.home_charger
+                    else DEFAULT_CONFIG["initial_soc_no_home"])
+            else:
+                veh.soc_kwh = None
+        leg = Leg()
+        leg.leg_index = leg_index
+        leg.origin_node = origin
+        leg.dest_node = dest
+        leg.origin_zone = from_zone
+        leg.dest_zone = to_zone
+        leg.scheduled_departure = departure
+        leg.departure_mode = mode
+        leg.dwell_min = dwell
+        leg.trip_purpose = purpose
+        leg.archetype = archetype
+        leg.enroute_target_soc = target
+        veh.legs.append(leg)
+        self._tour_prev_dest[agent_id] = to_node
+        # Path for this leg only; empty path stays pathless (node_size 0,
+        # assigned later by iteration-0).
+        ok, path_text = parser.get("path_node_sequence", "str")
+        if ok:
+            node_numbers = parse_path_integers(path_text)
+            if len(node_numbers) == 1:
+                raise ProgramStop(
+                    "agent %d path has a single node" % agent_id)
+            if len(node_numbers) >= 2:
+                for a, b in zip(node_numbers, node_numbers[1:]):
+                    if (a, b) not in self.link_map:
+                        raise ProgramStop(
+                            "agent %d path uses undefined link %d->%d"
+                            % (agent_id, a, b))
+                if node_numbers[0] != from_node or \
+                        node_numbers[-1] != to_node:
+                    raise ProgramStop(
+                        "agent %d path endpoints do not match its OD nodes"
+                        % agent_id)
+                self._assign_path_to_leg(leg, node_numbers)
+            else:
+                leg.node_size = 0
+                leg.link_ary = None
+        if is_new:
+            # Path is assigned to the leg first so the mirror includes it.
+            veh.begin_leg(leg)
+            self._register(veh, True)
+
+    def _assign_path_to_leg(self, leg, node_numbers):
+        # AddPathToVehicle (DTALite.cpp:2971), per leg.
+        leg.node_size = len(node_numbers)
+        leg.link_ary = [VehicleLink(MAX_LINK_NO)
+                        for _ in range(len(node_numbers))]
+        leg.distance = f32(0)
+        for i in range(1, len(node_numbers)):
+            link_no = self.link_map[(node_numbers[i - 1], node_numbers[i])]
+            leg.link_ary[i - 1].link_no = link_no
+            leg.distance = f32(leg.distance + self.links[link_no].length)
+        leg.origin_node = self.node_index[node_numbers[0]]
+        leg.dest_node = self.node_index[node_numbers[-1]]
 
     def _register(self, veh, is_new):
         # create-branch registration: g_VehicleMap insert plus the

@@ -25,15 +25,12 @@ def run_loading(input_dir, output_dir, reroute_callback=None,
             "pysim implements a single loading pass; the scenario requests "
             "%d assignment iterations" % (world.num_iterations + 1))
     world.read_inputs()
-    sim = Simulator(world)
-    sim.assign_paths_iteration_zero()
-    sim.network_loading()
-    os.makedirs(output_dir, exist_ok=True)
-    write_agent_file(world, os.path.join(output_dir, "output_agent.csv"))
-    # Charging accounting post-pass. charging=None means auto: it runs
-    # when input_charger.csv is present, with default parameters.
-    # charging=False disables it always; a dict enables it with those
-    # parameters overriding the defaults (and requires the file).
+    # Charging accounting config, resolved before simulation starts:
+    # charging=None means auto (runs when input_charger.csv is
+    # present, with default parameters); charging=False disables it
+    # always; a dict enables it with those parameters overriding the
+    # defaults (and requires the file). Tour mode gets the inline
+    # ChargingEngine (slice 2); legacy mode keeps the v1 post-pass.
     charger_path = os.path.join(input_dir, "input_charger.csv")
     charge_cfg = None
     if charging is False:
@@ -48,9 +45,23 @@ def run_loading(input_dir, output_dir, reroute_callback=None,
     elif os.path.exists(charger_path):
         from .charging import DEFAULT_CONFIG
         charge_cfg = dict(DEFAULT_CONFIG)
+    world.charging_engine = None
+    if charge_cfg is not None and world.tour_mode:
+        from .charging import ChargingEngine
+        world.charging_engine = ChargingEngine(world, charge_cfg)
+    sim = Simulator(world)
+    sim.assign_paths_iteration_zero()
+    sim.network_loading()
+    os.makedirs(output_dir, exist_ok=True)
+    write_agent_file(world, os.path.join(output_dir, "output_agent.csv"))
     if charge_cfg is not None:
-        from .charging import run_charging
-        world.charging_summary = run_charging(world, output_dir, charge_cfg)
+        if world.charging_engine is not None:
+            world.charging_summary = world.charging_engine.finalize(
+                world, output_dir)
+        else:
+            from .charging import run_charging
+            world.charging_summary = run_charging(world, output_dir,
+                                                  charge_cfg)
     else:
         world.charging_summary = None
     return world
