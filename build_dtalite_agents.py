@@ -6,8 +6,9 @@
 # Inputs (auto-found under input_files/ next to this script, or
 # passed explicitly): 1_activity_plans.csv, 3_home_charger_access.csv,
 # 4_car_fleet.csv, and input_node.csv from build_dtalite_network.py.
-# Outputs (into --out, default dtalite_agents/): input_agent.csv and
-# optional_vehicle_type.csv.
+# Outputs (into --out, default dtalite_inputs/ next to this script,
+# so the agent files sit with the network files for the run):
+# input_agent.csv and optional_vehicle_type.csv.
 #
 # Week model: the data holds ONE weekday plan per person, so the same
 # plan is repeated for day = 0..days-1 (default 7). There is no
@@ -343,7 +344,7 @@ def main():
                     "(default: dtalite_inputs/input_node.csv next to "
                     "this script)")
     ap.add_argument("--out", default=None,
-                    help="output dir (default: dtalite_agents/ next to "
+                    help="output dir (default: dtalite_inputs/ next to "
                     "this script)")
     ap.add_argument("--days", type=int, default=7,
                     help="days to repeat the weekday plan (default 7)")
@@ -356,7 +357,7 @@ def main():
                            "home")
     fleet_path = find_input(here, args.fleet, "*car_fleet.csv", "fleet")
     nodes_path = find_nodes(here, args.nodes)
-    out_dir = Path(args.out) if args.out else here / "dtalite_agents"
+    out_dir = Path(args.out) if args.out else here / "dtalite_inputs"
     out_dir.mkdir(parents=True, exist_ok=True)
     print("plans:", plans_path)
     print("home chargers:", home_path)
