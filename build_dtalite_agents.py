@@ -31,6 +31,11 @@
 #       something the file states outright.
 #   trip_purpose = B.act_purpose (the destination activity's purpose;
 #       the charging decision module uses it for home charging).
+#       The plans doc lists only home/work/other, but the data also
+#       has e.g. school: anything outside home/work/other is mapped
+#       to "other", because the loader only accepts those three.
+#       The run prints the raw purpose counts so the mapping can be
+#       revisited later (e.g. school as a fixed departure like work).
 #   departure_mode = "fixed" when A.act_purpose is home or work
 #       (leave at the scheduled clock time), "dwell" when it is other
 #       (leave after the dwell at the origin).
@@ -198,6 +203,7 @@ def read_plans(path):
     # skipped. A missing POINT_X/Y fails loud naming person/act_id.
     persons = {}
     counts = Counter()
+    warned_purposes = set()
     with open(path, newline="", encoding="utf-8") as fh:
         reader = csv.DictReader(fh)
         for row in reader:
@@ -218,10 +224,20 @@ def read_plans(path):
                     "person %d act_id %d is missing POINT_X/Y"
                     % (person, act_id))
             purpose = str(row.get("act_purpose", "")).strip().lower()
+            counts["raw_purpose:" + purpose] += 1
             if purpose not in ("home", "work", "other"):
-                raise SystemExit(
-                    "person %d act_id %d has unknown act_purpose %r"
-                    % (person, act_id, row.get("act_purpose")))
+                # The plans doc lists only home/work/other, but the
+                # data also has e.g. school. The loader only accepts
+                # home/work/other, so anything else becomes "other"
+                # (dwell departure); the raw counts are printed by
+                # main so the mapping can be revisited later.
+                if purpose not in warned_purposes:
+                    warned_purposes.add(purpose)
+                    print("WARNING: unknown act_purpose %r, mapped to "
+                          "'other' (person %d act_id %d)"
+                          % (row.get("act_purpose"), person, act_id),
+                          file=sys.stderr)
+                purpose = "other"
             dep_raw = str(row.get("dep_time", "")).strip()
             act_time_raw = str(row.get("act_time", "")).strip()
             persons.setdefault(person, []).append({
@@ -354,6 +370,12 @@ def main():
     print("persons in plans: %d, activities kept: %d, non-car rows "
           "skipped: %d" % (len(persons), counts["activities"],
                            counts["skipped_non_car"]))
+    raw_purposes = sorted(
+        (key[len("raw_purpose:"):], value)
+        for key, value in counts.items()
+        if key.startswith("raw_purpose:"))
+    print("raw act_purposes in plans: " + ", ".join(
+        "%s %d" % (name, value) for name, value in raw_purposes))
 
     # Snap every distinct day-plan activity once.
     snap_distances = []
