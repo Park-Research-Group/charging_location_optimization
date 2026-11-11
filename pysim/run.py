@@ -66,6 +66,16 @@ def run_loading(input_dir, output_dir, reroute_callback=None,
                                                   charge_cfg)
     else:
         world.charging_summary = None
+    # v7: report degraded nearest-charger lookups (same style as
+    # the iteration-0 cache stats). The consistency rule in
+    # nearest.py should keep this at zero; a nonzero count is
+    # visible, not silent, and means the map still has a hole.
+    engine = world.charging_engine
+    if engine is not None and engine.nearest_map is not None:
+        broken = engine.nearest_map.broken_lookups
+        if broken > 0:
+            print("nearest-charger map: %d broken lookups "
+                  "degraded to no-charger" % broken)
     return world
 
 

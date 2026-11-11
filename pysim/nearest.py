@@ -17,7 +17,7 @@
 # per-site search.
 from collections import deque
 
-from .cpp import ProgramStop, f32, floating_less
+from .cpp import f32, floating_less
 from .decision import KM_PER_MILE
 from .sp import MAX_SPLABEL
 
@@ -68,6 +68,13 @@ class NearestChargerMap:
         self.dist_km = [float("inf")] * n
         self.pred_to = [-1] * n
         self.pred_from = [-1] * n
+        # v7: degraded lookups. path_to_charger never raises for a
+        # single bad node: a broken chain degrades to "no reachable
+        # charger" (None) and is counted here, so the run continues
+        # and the count is reported at the end of the run. The
+        # _build_reverse consistency rule below should keep this at
+        # zero; a nonzero count means the map still has a hole.
+        self.broken_lookups = 0
         if not self.sites:
             return
         best = _best_site_per_node(self.sites)
@@ -83,9 +90,12 @@ class NearestChargerMap:
     def path_to_charger(self, node_id):
         # [link_no, ...] along the time-shortest path node_id ->
         # nearest charger, in travel order; [] when the node IS a
-        # charger node. Raises ProgramStop if the predecessor chain
-        # does not terminate at the stored site's node (internal
-        # inconsistency, same fail-loud policy as _build_via_path).
+        # charger node; None when no charger is reachable from the
+        # node. v7: a broken predecessor chain ALSO returns None
+        # (and is counted in broken_lookups) instead of raising
+        # ProgramStop -- one bad node must never kill a run. The
+        # caller treats None as "no reachable charger" and falls
+        # through to existing behavior.
         idx = self.site_index[node_id]
         if idx < 0:
             return None
@@ -97,9 +107,8 @@ class NearestChargerMap:
         while node != site.node_id:
             link_no = self.pred_to[node]
             if link_no < 0 or len(links) > len(self.world.nodes):
-                raise ProgramStop(
-                    "nearest-charger map: broken path from node %d "
-                    "to charger %s" % (node_id, site.charger_id))
+                self.broken_lookups += 1
+                return None
             links.append(link_no)
             node = self.world.links[link_no].to_id
         return links
@@ -159,6 +168,30 @@ class NearestChargerMap:
                     # decreases, so re-queueing terminates.
                     better = new_key < _source_key(
                         self.sites, source[from_id])
+                if not better and self.pred_to[from_id] == link_no:
+                    # v7 consistency (root cause of the v6 crash):
+                    # from_id's stored path runs through cur on
+                    # exactly this link. If cur's source changed
+                    # since from_id was derived from it -- via the
+                    # equal-cost tie-break, or a strict improvement
+                    # smaller than the 0.01 quantisation -- then
+                    # from_id's stored site no longer matches the
+                    # charger its pred_to chain actually leads to,
+                    # and the chain can end at a different charger
+                    # node (whose pred_to is -1) and break. The
+                    # same staleness hits dist_km when cur's path
+                    # changed at equal time (a longer-distance
+                    # route), which would corrupt the reachability
+                    # check that reads dist_km. Re-derive from_id
+                    # from cur's current label even though the
+                    # recomputed cost is not "better": the cost
+                    # can only move within the 0.01 quantisation,
+                    # so this cannot undo a strictly better label,
+                    # and the re-queue below propagates the fix to
+                    # from_id's own dependents.
+                    if source[cur] != source[from_id] or \
+                            abs(new_dist - label_dist[from_id]) > 1e-9:
+                        better = True
                 if not better:
                     continue
                 if new_time > world.horizon - 1:
