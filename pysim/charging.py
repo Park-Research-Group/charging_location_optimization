@@ -20,7 +20,7 @@ import os
 
 from .cpp import CsvParser, ProgramStop
 from .decision import choose_charger_for_trigger, decide_charging, \
-    find_enroute_charger, _links_energy, leg_free_flow_energy
+    _links_energy, leg_free_flow_energy
 from .sp import SPNetwork, find_best_path, multi_run_valid
 
 KM_PER_MILE = 1.60934  # DTALite link lengths are in miles
@@ -197,10 +197,14 @@ class ChargingEngine:
         # iteration-0 net (fftt never changes during loading, so
         # reuse is valid); created lazily on first use otherwise.
         self.ff_net = None
-        # Nearest-charger map (v5): built once by
-        # build_nearest_map when some leg carries a non-blank
-        # archetype, else None (blank-archetype runs pay
-        # nothing and behave exactly as v4).
+        # Nearest-charger map (v5 triggers, v6 en-route decision):
+        # built once by build_nearest_map and owned by the engine.
+        # v6 builds it on every charging run: the en-route
+        # decision needs it for every leg, not only archetype
+        # legs, so blank-archetype runs no longer behave as v4
+        # (the en-route charger choice changed). When the network
+        # cannot support the multi-source runs the map stays None
+        # and the callers fall back to per-site searches.
         self.nearest_map = None
 
     def _ff_net(self):
@@ -209,24 +213,16 @@ class ChargingEngine:
         return self.ff_net
 
     def build_nearest_map(self):
-        # v5: precompute the nearest-charger map for archetype
-        # triggers (nearest.py). No-op when no leg carries a
-        # non-blank archetype, so blank-archetype runs pay
-        # nothing and behave exactly as v4. When the network
-        # cannot support the multi-source runs, the map stays
-        # None and choose_charger_for_trigger falls back to a
-        # per-site search (one stdout line, once).
+        # v5/v6: precompute the nearest-charger map (nearest.py).
+        # v5 built it only when some leg carried a non-blank
+        # archetype, so blank-archetype runs paid nothing and
+        # behaved exactly as v4. v6 drops that gate: the en-route
+        # decision now looks the charger up in the map for every
+        # leg, so the map is built on every charging run. When
+        # the network cannot support the multi-source runs, the
+        # map stays None and the callers fall back to per-site
+        # searches (one stdout line, once).
         self.nearest_map = None
-        has_archetype = False
-        for veh in self.world.vehicles.values():
-            for leg in veh.legs:
-                if leg.archetype.strip():
-                    has_archetype = True
-                    break
-            if has_archetype:
-                break
-        if not has_archetype:
-            return
         ff_net = self._ff_net()
         if not multi_run_valid(self.world, ff_net):
             print("nearest-charger map unavailable "
@@ -345,22 +341,42 @@ class ChargingEngine:
                     leg.trigger = "opportunistic"
                     leg.trigger_charger_id = site.charger_id
                     return ("enroute", site, leg.enroute_target_soc)
-        # SP queries are the expensive part (two per site), so the
-        # en-route search runs only when the leg may actually need
-        # it: SoC within the margin of the leg's energy need. The
-        # search returns the site plus its via path; the via path
-        # is stashed on the leg for generation to splice in
-        # (slice 3a) and cleared whenever no en-route stop applies.
+        # The en-route choice (v6) is the nearest charger to the
+        # leg's origin by free-flow time, looked up in the
+        # precomputed nearest-charger map (nearest.py): the same
+        # "closest reachable" seam the v5 triggers use
+        # (choose_charger_for_trigger, "liquid" branch). The
+        # choice is destination-blind and there is no
+        # second-nearest attempt: if the nearest charger is not
+        # reachable on current SoC there is no stop. A site at
+        # the leg's origin or destination node is not an en-route
+        # answer either (the via splice needs both legs
+        # non-empty), so it also means no stop; the leg then
+        # falls through to the destination rule or "none". The
+        # lookup runs only when the leg may actually need it:
+        # SoC within the margin of the leg's energy need. The
+        # site plus its via path is stashed on the leg for
+        # generation to splice in (slice 3a) and cleared
+        # whenever no en-route stop applies. The v4
+        # multi-destination/per-site search (find_enroute_charger
+        # in decision.py) is bypassed in v6 and kept only so the
+        # choice can be reverted.
         enroute = None
         enroute_via = None
         margin = self.config.get("enroute_margin_frac", 0.1) * battery
         if soc < leg_energy + margin:
-            found = find_enroute_charger(
-                world, self._ff_net(), veh, leg, soc, consumption,
-                leg.enroute_target_soc)
+            found = choose_charger_for_trigger(
+                self.nearest_map, "liquid", leg.origin_node,
+                leg.dest_node, soc, consumption, battery,
+                leg.enroute_target_soc, world=world,
+                ff_net=self._ff_net(), veh=veh,
+                departure=float(veh.departure))
             if found is not None:
-                enroute, links_to, links_from, via_time = found
-                enroute_via = (links_to, links_from, via_time)
+                site, links_to, links_from, via_time = found
+                if site.node_id not in (leg.origin_node,
+                                        leg.dest_node):
+                    enroute = site
+                    enroute_via = (links_to, links_from, via_time)
         leg.enroute_via = enroute_via
         ctx = {
             "soc_kwh": soc,

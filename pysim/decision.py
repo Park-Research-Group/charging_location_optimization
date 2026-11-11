@@ -97,6 +97,7 @@ def _path_time(world, ff_net, path_links, departure):
 def _find_enroute_charger_multi(world, ff_net, veh, leg, soc_kwh,
                                 consumption, target_soc_frac, sites,
                                 departure, battery):
+    # v6 bypasses this too (see find_enroute_charger below).
     # Multi-destination version of the search below: two
     # label-correcting runs (forward from the origin, reverse
     # from the destination) replace the 2xS per-site
@@ -192,6 +193,11 @@ def _find_enroute_charger_multi(world, ff_net, veh, leg, soc_kwh,
 
 def find_enroute_charger(world, ff_net, veh, leg, soc_kwh, consumption,
                          target_soc_frac):
+    # v6 BYPASSES this search: the en-route decision now uses the
+    # nearest-charger map (choose_charger_for_trigger, "liquid"
+    # branch, called from decide_for_leg). Kept, unused, so the
+    # v4 min-detour choice can be restored by pointing
+    # decide_for_leg back at this function.
     # Best viable en-route charger site for this leg, or None.
     # Viability for a site at node C: the free-flow shortest path
     # origin -> C exists with energy <= soc_kwh, and the free-flow
@@ -296,6 +302,10 @@ def choose_charger_for_trigger(nearest_map, trigger, from_node, dest_node,
                                target_soc_frac, walk_tolerance_m=None,
                                world=None, ff_net=None, veh=None,
                                departure=0.0):
+    # v6: the departure-time en-route decision reuses the
+    # "liquid" branch of this seam (see decide_for_leg); the
+    # caller applies the origin/destination exclusion, which
+    # the triggers do not need.
     # "Closest reachable charger" for an archetype trigger (v5
     # Phase 1): (site, links_to_charger, links_from_charger,
     # via_time_min) or None. No weights, no scoring features --
