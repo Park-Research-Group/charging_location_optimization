@@ -13,7 +13,7 @@ from .outputs import write_agent_file
 
 
 def run_loading(input_dir, output_dir, reroute_callback=None,
-                charging=None):
+                charging=None, workers=None):
     world = World(input_dir)
     world.reroute_callback = reroute_callback
     if world.flow_model != 2:
@@ -50,7 +50,9 @@ def run_loading(input_dir, output_dir, reroute_callback=None,
         from .charging import ChargingEngine
         world.charging_engine = ChargingEngine(world, charge_cfg)
     sim = Simulator(world)
-    sim.assign_paths_iteration_zero()
+    sim.assign_paths_iteration_zero(workers=workers)
+    if world.charging_engine is not None:
+        world.charging_engine.build_nearest_map()
     sim.network_loading()
     os.makedirs(output_dir, exist_ok=True)
     write_agent_file(world, os.path.join(output_dir, "output_agent.csv"))
@@ -68,10 +70,38 @@ def run_loading(input_dir, output_dir, reroute_callback=None,
 
 
 def main(argv):
-    if len(argv) < 3:
-        print("usage: python -m pysim.run <input_dir> <output_dir>")
+    # Optional --workers N (or --workers=N) after the two positional
+    # arguments; plain `python -m pysim.run <in> <out>` is unchanged
+    # and uses the automatic choice (pool when beneficial, else
+    # serial). See sp_mp for the Windows `__main__` note: this
+    # module already runs under its own guard, so the pool works.
+    workers = None
+    args = []
+    i = 1
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--workers" and i + 1 < len(argv):
+            try:
+                workers = int(argv[i + 1])
+            except ValueError:
+                print("python -m pysim.run: --workers needs an integer")
+                return 2
+            i += 2
+        elif arg.startswith("--workers="):
+            try:
+                workers = int(arg.split("=", 1)[1])
+            except ValueError:
+                print("python -m pysim.run: --workers needs an integer")
+                return 2
+            i += 1
+        else:
+            args.append(arg)
+            i += 1
+    if len(args) < 2:
+        print("usage: python -m pysim.run <input_dir> <output_dir> "
+              "[--workers N]")
         return 2
-    run_loading(argv[1], argv[2])
+    run_loading(args[0], args[1], workers=workers)
     return 0
 
 

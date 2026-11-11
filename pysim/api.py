@@ -16,7 +16,7 @@ from .run import run_loading
 
 
 def run_pysim(input_dir, output_dir, verbose=False, reroute_callback=None,
-              charging=None):
+              charging=None, workers=None):
     """Run one PySim loading pass.
 
     input_dir is a directory holding DTALite-format input files. It is
@@ -44,6 +44,20 @@ def run_pysim(input_dir, output_dir, verbose=False, reroute_callback=None,
     dwell charging) and also writes output_decisions.csv, listed
     under outputs["decisions"].
 
+    workers controls the iteration-0 shortest-path multiprocessing
+    (see pysim.sp_mp): None (default) is automatic -- a spawn Pool
+    when there are enough distinct origin/destination keys and more
+    than one CPU, serial otherwise; 1 (or 0) is always serial; N >= 2
+    uses a Pool of N workers. Pool and serial runs produce identical
+    outputs, and any pool failure falls back to the serial path, so
+    a run that would have worked serially still works. The
+    PYSIM_SP_WORKERS environment variable overrides the automatic
+    choice when workers is None (set it to 1 to force serial).
+    A driver script that calls run_pysim must put the call under
+    `if __name__ == "__main__":` for the pool to work on Windows
+    (spawn re-imports the calling script); `python -m pysim.run`
+    already satisfies this.
+
     Returns a dict with the input/output dirs, the output paths, the
     agent counts, and the charging summary (or None). Raises ProgramStop
     (from pysim.cpp) on out-of-scope scenarios: flow models other than
@@ -59,7 +73,7 @@ def run_pysim(input_dir, output_dir, verbose=False, reroute_callback=None,
         print("pysim: %s -> %s" % (input_dir, output_dir))
     world = run_loading(input_dir, output_dir,
                         reroute_callback=reroute_callback,
-                        charging=charging)
+                        charging=charging, workers=workers)
     agents = len(world.vehicles)
     completed = sum(1 for veh in world.vehicles.values() if veh.complete)
     outputs = {

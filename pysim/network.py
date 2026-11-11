@@ -73,7 +73,7 @@ class Link:
         "ring_arrival", "ring_departure",
         "departure_based_tt", "departure_count", "prevailing_tt",
         "buffer_waiting_time", "jam_time_stamp",
-        "org_geometry")
+        "org_geometry", "s3_consts")
 
     def __init__(self):
         self.loading_buffer = deque()
@@ -96,8 +96,9 @@ class Link:
         self.buffer_waiting_time = f32(0)
         self.jam_time_stamp = f32(0)
         self.org_geometry = ""
+        self.s3_consts = None
 
-    def setup_loading(self, horizon):
+    def setup_loading(self, horizon, min_inflow_ratio=0.0):
         # DTALink::SetupMOE (DTALite.h:2203) minus the MOE list: FFTT is
         # (re)computed here, at network read and again at the start of
         # every loading. The departure-based travel time total restarts
@@ -128,6 +129,25 @@ class Link:
         self.counts_vtype = [0] * 15
         self.departure_count = 0
         self.buffer_waiting_time = f32(0)
+        # Stage-3 constants (loading.py step), precomputed once here:
+        # the per-step out-capacity, its x3 relaxed value, the freeway
+        # inflow cap, the jam term for the ring+jam n_allow, and the
+        # minimum-inflow floor. Each is the plain-float value of the
+        # float32 quantity the old loop recomputed (and re-rounded)
+        # every step; the expressions below are the old ones, run once.
+        # setup_loading runs again at the start of every loading, so
+        # the table is fresh for each run (min_inflow_ratio comes from
+        # the world; the read-time call leaves it at its 0.0 default).
+        per_interval = float(self.lane_capacity) * 0.1 / 60.0 * \
+            float(self.outflow_lanes)
+        cap = f32(per_interval)
+        cap_relax = f32(cap * f32(3))
+        inflow_cap = 1800 * 0.1 / 60.0 * float(self.inflow_lanes)
+        jam = f32(f32(self.length * f32(self.outflow_lanes)) * \
+                  self.k_jam)
+        inflow_rate = float(f32(cap) * f32(min_inflow_ratio))
+        self.s3_consts = (float(cap), float(cap_relax), inflow_cap,
+                         float(jam), inflow_rate)
 
 
 class VehicleLink:
@@ -148,6 +168,7 @@ class Leg:
         "leg_index", "origin_node", "dest_node", "origin_zone", "dest_zone",
         "scheduled_departure", "departure_mode", "dwell_min",
         "trip_purpose", "archetype", "enroute_target_soc",
+        "soc_threshold_frac", "walk_tolerance_m",
         "link_ary", "node_size", "original_link_ary", "original_node_size",
         "distance", "departure_actual", "arrival_actual", "trip_fftt",
         "delay", "soc_start_kwh", "soc_end_kwh", "complete", "stranded",
@@ -157,7 +178,9 @@ class Leg:
         "decision_remaining_kwh", "charger_stop", "stranded_node",
         "dwell_plug_index", "enroute_plug_index", "enroute_via",
         "depleted", "tow_count", "stranding_count",
-        "stranded_rows_recorded", "tow_hops")
+        "stranded_rows_recorded", "tow_hops",
+        "trigger", "trigger_charger_id", "liquid_fired",
+        "pending_via")
 
     def __init__(self):
         self.leg_index = 0
@@ -171,6 +194,8 @@ class Leg:
         self.trip_purpose = "other"
         self.archetype = ""
         self.enroute_target_soc = 0.8
+        self.soc_threshold_frac = 0.20
+        self.walk_tolerance_m = 500.0
         self.link_ary = None
         self.node_size = 0
         self.original_link_ary = None
@@ -219,6 +244,17 @@ class Leg:
         self.tow_count = 0
         self.stranding_count = 0
         self.stranded_rows_recorded = 0
+        # Archetype triggers (v5, Phase 1): trigger /
+        # trigger_charger_id record a stop or charge actually
+        # planned or executed ("liquid", "plan_ahead", or
+        # "opportunistic", else ""); liquid_fired blocks a second
+        # liquid evaluation on this leg; pending_via holds a
+        # plan-ahead stop for a later leg until generation
+        # consumes it.
+        self.trigger = ""
+        self.trigger_charger_id = ""
+        self.liquid_fired = False
+        self.pending_via = None
         # Tow hops (slice 4): one (links_before, charger node
         # number, tow arrival time) per tow, in tow order, so the
         # writer can show the tow jump in path_node_sequence /
@@ -1150,6 +1186,20 @@ class World:
         archetype = archetype if ok else ""
         ok, target = parser.get("enroute_target_soc", "float")
         target = float(target) if ok else 0.8
+        # v5 per-leg trigger parameters: optional columns, so old
+        # v3 agent files (without them) load with the defaults.
+        ok, thresh = parser.get("soc_threshold_frac", "float")
+        thresh = float(thresh) if ok else 0.20
+        if thresh <= 0.0 or thresh > 1.0:
+            raise ProgramStop(
+                "agent %d leg %d soc_threshold_frac %s outside (0, 1]"
+                % (agent_id, leg_index, thresh))
+        ok, walk = parser.get("walk_tolerance_m", "float")
+        walk = float(walk) if ok else 500.0
+        if walk < 0.0:
+            raise ProgramStop(
+                "agent %d leg %d walk_tolerance_m %s is negative"
+                % (agent_id, leg_index, walk))
         ok, from_zone = parser.get("from_zone_id", "int", required=True)
         if not ok:
             return
@@ -1255,6 +1305,8 @@ class World:
         leg.trip_purpose = purpose
         leg.archetype = archetype
         leg.enroute_target_soc = target
+        leg.soc_threshold_frac = thresh
+        leg.walk_tolerance_m = walk
         veh.legs.append(leg)
         self._tour_prev_dest[agent_id] = to_node
         # Path for this leg only; empty path stays pathless (node_size 0,

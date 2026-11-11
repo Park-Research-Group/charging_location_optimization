@@ -19,9 +19,9 @@ import heapq
 import os
 
 from .cpp import CsvParser, ProgramStop
-from .decision import decide_charging, find_enroute_charger, \
-    leg_free_flow_energy
-from .sp import SPNetwork, find_best_path
+from .decision import choose_charger_for_trigger, decide_charging, \
+    find_enroute_charger, _links_energy, leg_free_flow_energy
+from .sp import SPNetwork, find_best_path, multi_run_valid
 
 KM_PER_MILE = 1.60934  # DTALite link lengths are in miles
 
@@ -191,15 +191,50 @@ class ChargingEngine:
         self.events = []       # tour-mode tuples (15 fields)
         self.home_events = []  # subset of events at HOME chargers
         self.stranded = []     # tour-mode tuples (13 fields)
+        # Free-flow energy per leg, cached by _leg_energy (below).
+        self._leg_energy_cache = {}
         # Free-flow SP network, set by the Simulator from its
         # iteration-0 net (fftt never changes during loading, so
         # reuse is valid); created lazily on first use otherwise.
         self.ff_net = None
+        # Nearest-charger map (v5): built once by
+        # build_nearest_map when some leg carries a non-blank
+        # archetype, else None (blank-archetype runs pay
+        # nothing and behave exactly as v4).
+        self.nearest_map = None
 
     def _ff_net(self):
         if self.ff_net is None:
             self.ff_net = SPNetwork(self.world, use_prevailing=False)
         return self.ff_net
+
+    def build_nearest_map(self):
+        # v5: precompute the nearest-charger map for archetype
+        # triggers (nearest.py). No-op when no leg carries a
+        # non-blank archetype, so blank-archetype runs pay
+        # nothing and behave exactly as v4. When the network
+        # cannot support the multi-source runs, the map stays
+        # None and choose_charger_for_trigger falls back to a
+        # per-site search (one stdout line, once).
+        self.nearest_map = None
+        has_archetype = False
+        for veh in self.world.vehicles.values():
+            for leg in veh.legs:
+                if leg.archetype.strip():
+                    has_archetype = True
+                    break
+            if has_archetype:
+                break
+        if not has_archetype:
+            return
+        ff_net = self._ff_net()
+        if not multi_run_valid(self.world, ff_net):
+            print("nearest-charger map unavailable "
+                  "(multi_run_valid false); per-trigger search fallback")
+            return
+        from .nearest import NearestChargerMap
+        self.nearest_map = NearestChargerMap(
+            self.world, ff_net, self.sites)
 
     def _dest_site(self, leg):
         sites = self.by_node.get(leg.dest_node)
@@ -208,6 +243,33 @@ class ChargingEngine:
     @staticmethod
     def _home_available(veh, leg):
         return leg.trip_purpose == "home" and veh.home_charger == 1
+
+    def _leg_energy(self, world, leg, consumption):
+        # Free-flow energy of a leg's current path, cached per
+        # leg: decide_for_leg sums the energies of all later
+        # legs for every leg, so without the cache each leg's
+        # energy is recomputed once per earlier leg. The cache
+        # is keyed by the leg object and validated against the
+        # exact link list object, its length, and the
+        # consumption: link lists are only ever replaced (via
+        # splice, reroute, tow), never edited in place after
+        # demand reading, so a changed path always misses and
+        # is recomputed. A cached value is the same sum
+        # leg_free_flow_energy computes, and the remaining sums
+        # re-add cached values in the same order, so the
+        # results are exactly identical.
+        ary = leg.link_ary
+        if ary is None:
+            return 0.0
+        hit = self._leg_energy_cache.get(id(leg))
+        if hit is not None and hit[0] is ary \
+                and hit[1] == len(ary) \
+                and hit[2] == consumption:
+            return hit[3]
+        energy = leg_free_flow_energy(world, leg, consumption)
+        self._leg_energy_cache[id(leg)] = \
+            (ary, len(ary), consumption, energy)
+        return energy
 
     def decide_for_leg(self, world, veh, leg):
         # Pre-trip decision for a leg that is beginning travel.
@@ -225,14 +287,64 @@ class ChargingEngine:
             return ("none", None, 0.0)
         battery, consumption = params
         soc = leg.soc_start_kwh
-        leg_energy = leg_free_flow_energy(world, leg, consumption)
+        leg_energy = self._leg_energy(world, leg, consumption)
         # Planning estimate: later legs' paths were assigned at
         # iteration 0, so their free-flow energies are known now.
         remaining = 0.0
         for later in veh.legs[veh.current_leg:]:
-            remaining += leg_free_flow_energy(world, later, consumption)
+            remaining += self._leg_energy(world, later, consumption)
         dest_site = self._dest_site(leg)
         home_available = self._home_available(veh, leg)
+        # Plan-ahead pending via (v5): a stop planned when the
+        # previous leg completed, consumed at this leg's
+        # generation. Reachability is re-validated with the
+        # current starting charge; a via that no longer fits is
+        # dropped and the leg falls through to the v4 rules.
+        if leg.pending_via is not None:
+            site, links_to, links_from, via_time = leg.pending_via
+            leg.pending_via = None
+            if _links_energy(world, links_to, consumption) \
+                    <= soc + 1e-9:
+                leg.enroute_via = (links_to, links_from, via_time)
+                leg.decision = "enroute"
+                leg.decision_charger_id = site.charger_id
+                leg.decision_target_soc = leg.enroute_target_soc
+                leg.decision_leg_energy_kwh = leg_energy
+                leg.decision_remaining_kwh = remaining
+                leg.trigger = "plan_ahead"
+                leg.trigger_charger_id = site.charger_id
+                return ("enroute", site, leg.enroute_target_soc)
+            leg.trigger = ""
+            leg.trigger_charger_id = ""
+        # Opportunistic trigger (v5): a charger within walking
+        # tolerance of the DESTINATION, looked up at trip start.
+        # The stop executes as an en-route park during the leg
+        # (existing charge_enroute machinery); a charger at the
+        # destination or at the origin is left to the v4 rules,
+        # and no reachable charger means no stop (normal leg).
+        if leg.archetype == "opportunistic" and leg.node_size >= 2 \
+                and not leg.stranded and not leg.depleted \
+                and leg.charger_stop is None:
+            found = choose_charger_for_trigger(
+                self.nearest_map, "opportunistic", leg.origin_node,
+                leg.dest_node, soc, consumption, battery,
+                leg.enroute_target_soc,
+                walk_tolerance_m=leg.walk_tolerance_m, world=world,
+                ff_net=self._ff_net(), veh=veh,
+                departure=float(veh.departure))
+            if found is not None:
+                site, links_to, links_from, via_time = found
+                if site.node_id != leg.dest_node and \
+                        site.node_id != leg.origin_node:
+                    leg.enroute_via = (links_to, links_from, via_time)
+                    leg.decision = "enroute"
+                    leg.decision_charger_id = site.charger_id
+                    leg.decision_target_soc = leg.enroute_target_soc
+                    leg.decision_leg_energy_kwh = leg_energy
+                    leg.decision_remaining_kwh = remaining
+                    leg.trigger = "opportunistic"
+                    leg.trigger_charger_id = site.charger_id
+                    return ("enroute", site, leg.enroute_target_soc)
         # SP queries are the expensive part (two per site), so the
         # en-route search runs only when the leg may actually need
         # it: SoC within the margin of the leg's energy need. The
@@ -366,6 +478,78 @@ class ChargingEngine:
                                  soc_after, end)
         return outcome
 
+    def charge_at_site_during_dwell(self, world, veh, leg, site,
+                                    arrival_time,
+                                    departure_next_or_None,
+                                    target_soc_frac):
+        # Forced dwell charge at a named site (v5 plan-ahead):
+        # apply_destination_charge mechanics, but the site and
+        # target are given explicitly instead of coming from the
+        # leg's "destination" decision. The caller only reaches
+        # here when no dwell charge actually ran: a completable
+        # trigger leg with a charger at its arrival node always
+        # decided "destination" (v4 rule 2 fires whenever soc <
+        # remaining, which is exactly the plan-ahead shortfall),
+        # so the reachable path is decision "destination" with
+        # outcome "queued-out" (plug busy past the next
+        # departure), not a "none" decision. Window is [arrival,
+        # D_next)
+        # (inf for a terminal leg, which cannot happen here: a
+        # trigger needs a next leg). Target is target_soc_frac *
+        # battery (the leg's enroute target, not the site tier
+        # target). Same event shape as a dwell charge (leg_index
+        # = the just-completed leg, charged_en_route = 0), same
+        # charge_outcome values, same plug recording. Returns the
+        # outcome string.
+        params = world.ev_params(veh)
+        if params is None:
+            return None
+        battery, _consumption = params
+        soc_at_arrival = leg.soc_end_kwh
+        target_kwh = target_soc_frac * battery
+        if target_kwh - soc_at_arrival <= 0:
+            leg.charge_outcome = "at-target"
+            return "at-target"
+        plug = min(range(site.plugs),
+                   key=lambda p: site.plug_free[p])
+        start = max(arrival_time, site.plug_free[plug])
+        if departure_next_or_None is not None and \
+                start >= departure_next_or_None:
+            leg.charge_outcome = "queued-out"
+            return "queued-out"
+        energy_needed = target_kwh - soc_at_arrival
+        time_needed = energy_needed / site.power_kw * 60.0
+        if departure_next_or_None is None:
+            charge_time = time_needed
+        else:
+            charge_time = min(time_needed,
+                              departure_next_or_None - start)
+        if charge_time <= 0:
+            leg.charge_outcome = "queued-out"
+            return "queued-out"
+        energy = charge_time * site.power_kw / 60.0
+        soc_after = soc_at_arrival + energy
+        end = start + charge_time
+        site.plug_free[plug] = end
+        leg.dwell_plug_index = plug
+        veh.soc_kwh = soc_after
+        leg.soc_end_kwh = soc_after
+        outcome = "charged-partial" if charge_time < time_needed \
+            else "charged-destination"
+        leg.charge_outcome = outcome
+        event = (veh.agent_id, veh.tour_id, site.charger_id,
+                 site.node_number, arrival_time,
+                 start - arrival_time, start, end, energy,
+                 soc_at_arrival, soc_after, site.power_kw,
+                 leg.leg_index, 0, 0)
+        self.events.append(event)
+        site.events.append(event)
+        if site.charger_id == "HOME":
+            self.home_events.append(event)
+        veh.last_dwell_charge = (site.charger_id, leg.dest_node,
+                                 site.power_kw, soc_after, end)
+        return outcome
+
     def try_stay_and_finish(self, world, veh, leg, d_next):
         # Stay-and-finish check (slice 3b): prefer charging where
         # the vehicle already is over detouring to an en-route
@@ -379,6 +563,11 @@ class ChargingEngine:
         # the leg for the stay end and does not generate it now.
         # Queue estimate is 0 throughout: only the plug's own
         # free time can delay the stay, never another vehicle.
+        # Trigger legs (v5) never stay: the committed via is kept,
+        # and for plan-ahead legs the re-decision gate below would
+        # consume the pending via and then discard it.
+        if getattr(leg, "trigger", ""):
+            return None
         if veh.last_dwell_charge is None or leg.decision != "enroute" \
                 or leg.departure_mode != "dwell":
             return None
@@ -859,10 +1048,23 @@ def _write_decisions(output_dir, world, engine):
     # Outcome precedence: stranded > queued-out > charged-partial >
     # charged-destination > at-target > completed. day follows outputs.py: the
     # actual departure when the leg departed, else the scheduled one.
+    # v5: trigger columns appear only when at least one leg in
+    # the run recorded a trigger, so blank-archetype runs stay
+    # byte-identical to v4.
+    has_trigger = False
+    for veh in world.vehicles.values():
+        for leg in veh.legs:
+            if leg.trigger:
+                has_trigger = True
+                break
+        if has_trigger:
+            break
     lines = ["agent_id,leg_index,day,soc_at_departure_kwh,"
              "leg_energy_kwh,remaining_energy_kwh,"
              "destination_charger,decision,enroute_charger_id,"
-             "target_soc,outcome\n"]
+             "target_soc,outcome"
+             + (",trigger,trigger_charger_id" if has_trigger else "")
+             + "\n"]
     for agent_id in sorted(world.vehicles):
         veh = world.vehicles[agent_id]
         for leg in sorted(veh.legs, key=lambda l: l.leg_index):
@@ -887,14 +1089,25 @@ def _write_decisions(output_dir, world, engine):
                 outcome = "at-target"
             else:
                 outcome = "completed"
-            lines.append(
-                "%d,%d,%d,%.3f,%.3f,%.3f,%d,%s,%s,%.3f,%s\n"
-                % (veh.agent_id, leg.leg_index, day,
-                   float(leg.soc_start_kwh),
-                   float(leg.decision_leg_energy_kwh),
-                   float(leg.decision_remaining_kwh), dest_charger,
-                   leg.decision, enroute_id,
-                   float(leg.decision_target_soc), outcome))
+            if has_trigger:
+                lines.append(
+                    "%d,%d,%d,%.3f,%.3f,%.3f,%d,%s,%s,%.3f,%s,%s,%s\n"
+                    % (veh.agent_id, leg.leg_index, day,
+                       float(leg.soc_start_kwh),
+                       float(leg.decision_leg_energy_kwh),
+                       float(leg.decision_remaining_kwh), dest_charger,
+                       leg.decision, enroute_id,
+                       float(leg.decision_target_soc), outcome,
+                       leg.trigger, leg.trigger_charger_id))
+            else:
+                lines.append(
+                    "%d,%d,%d,%.3f,%.3f,%.3f,%d,%s,%s,%.3f,%s\n"
+                    % (veh.agent_id, leg.leg_index, day,
+                       float(leg.soc_start_kwh),
+                       float(leg.decision_leg_energy_kwh),
+                       float(leg.decision_remaining_kwh), dest_charger,
+                       leg.decision, enroute_id,
+                       float(leg.decision_target_soc), outcome))
     with open(os.path.join(output_dir, "output_decisions.csv"),
               "w", newline="", encoding="utf-8") as fh:
         fh.writelines(lines)

@@ -11,6 +11,7 @@ from .charging import KM_PER_MILE
 from .cpp import ProgramStop, f32, floating_less, less_eq
 from .network import VehicleLink
 from .sp import SPNetwork, find_best_path
+from .sp_mp import resolve_keys_parallel
 
 SIM_INTERVAL = 0.1  # g_DTASimulationInterval (double)
 
@@ -29,6 +30,9 @@ class Simulator:
         # charger searches instead of rebuilding it per leg.
         self.ff_net = None
         self.td_map = {}
+        # Freeway-only links for stage 5, built in network_loading:
+        # ring buffers are read only in the stage-3 freeway branch.
+        self.freeway_links = None
         # Agent ids parked at en-route chargers (slice 3a), in park
         # order. step() resumes them before stage 0; _discharge_link
         # appends when a vehicle parks.
@@ -36,16 +40,100 @@ class Simulator:
 
     # ----- iteration 0 of the agent-based driver -----
 
-    def assign_paths_iteration_zero(self):
+    def _sp_path(self, world, net, cache, use_cache,
+                 origin_zone, origin, departure, dest_zone, dest,
+                 demand_type, vot):
+        # Iteration-0 shortest path with memoization. The path
+        # depends only on (origin zone/node, destination zone/node),
+        # not on the departure time: the iteration-0 network is built
+        # from free-flow times, so every assignment interval holds the
+        # same link times (see network.travel_time_by_min), and
+        # find_best_path reads the interval only to index that table.
+        # Demand type and value of time are not in the key either:
+        # find_best_path uses vot only for the vot <= 0.01 -> 1 clamp
+        # and demand_type only for the 0 -> 1 clamp (the generalized
+        # cost flag is off, so neither affects the returned path).
+        # The caller guards all of this with the uniformity tripwire
+        # in assign_paths_iteration_zero; if the table ever becomes
+        # time-varying, use_cache is False and every leg gets its own
+        # search, exactly as before. The cached value is the raw
+        # search result; the caller still owns setting node_size /
+        # link_ary / distance, and the RNG draw stays in the caller's
+        # loop, so the random stream and every leg field are identical
+        # with or without a cache hit.
+        key = (origin_zone, origin, dest_zone, dest)
+        if use_cache:
+            hit = cache.get(key)
+            if hit is not None:
+                self.sp_cache_hits += 1
+                return hit
+        node_size, path_links, _ = find_best_path(
+            world, net, origin_zone, origin, departure,
+            dest_zone, dest, demand_type, vot)
+        result = (node_size, tuple(path_links))
+        if use_cache:
+            cache[key] = result
+            self.sp_cache_misses += 1
+        return result
+
+    def _report_sp_cache(self):
+        total = self.sp_cache_hits + self.sp_cache_misses
+        self.world.sp_cache_hits = self.sp_cache_hits
+        self.world.sp_cache_misses = self.sp_cache_misses
+        if total > 0:
+            print("iteration-0 shortest paths: %d computed, %d reused "
+                  "from cache (%.0f%% hit rate)"
+                  % (self.sp_cache_misses, self.sp_cache_hits,
+                     100.0 * self.sp_cache_hits / total))
+
+    def assign_paths_iteration_zero(self, workers=None):
         # g_AgentBasedDynamicTrafficAssignmentSimulation, iteration 0:
         # pathless agents (by zone bucket, then read order) get a free-flow
         # shortest path on the physical network; preassigned paths are kept.
+        # workers controls the Wave-2 multiprocessing of the distinct
+        # SP keys (see sp_mp): None means automatic (a spawn Pool when
+        # there are enough distinct keys and more than one CPU, else
+        # serial); 1 (or 0) is serial; N >= 2 uses a Pool of N workers.
+        # The pool only ever resolves keys; the bucket walk, the RNG
+        # draws and the assignment all stay in the main process, so a
+        # pool run and a serial run produce identical outputs. Any
+        # pool failure falls back to resolving the same keys serially.
         world = self.world
         net = SPNetwork(world, use_prevailing=False)
         self.ff_net = net
         engine = getattr(world, "charging_engine", None)
         if engine is not None:
             engine.ff_net = net
+        # Memoization tripwire: the cache in _sp_path is valid only
+        # while the SP table is the same in every interval. The
+        # rebuild walk visits every interval with the same free-flow
+        # value, so compare the first, middle and last columns for
+        # every link -- O(links), and any time-varying table trips
+        # it. A tripped wire disables the cache, not the run.
+        self.sp_cache_hits = 0
+        self.sp_cache_misses = 0
+        cache = {}
+        use_cache = True
+        if net.td_time is not None and world.num_periods > 1:
+            cols = (0, world.num_periods // 2,
+                    world.num_periods - 1)
+            for row in net.td_time:
+                if row[cols[0]] != row[cols[1]] or \
+                        row[cols[0]] != row[cols[2]]:
+                    use_cache = False
+                    break
+        # Phase 1 -- the sequential bucket walk, exactly as before:
+        # guards, gen_rng.ratio() draws in bucket order, key
+        # extraction. No path is computed here, so the random stream
+        # and the set of legs needing a path are identical whether
+        # the keys are resolved serially or in a pool. Each call is
+        # (key, departure, demand_type, vot, target) with target
+        # (veh, leg) in tour mode or (veh, None) in legacy mode.
+        # A leg (or vehicle) appears at most once in the walk, so
+        # deferring the assignment to phase 3 changes nothing: no
+        # guard in the walk reads a node_size set by an earlier
+        # assignment.
+        calls = []
         if world.tour_mode:
             # Per leg: buckets keyed by (leg origin zone, interval of
             # the leg's scheduled departure). Paths land on the leg,
@@ -67,23 +155,102 @@ class Simulator:
                     world.gen_rng.ratio()  # pVeh->GetRandomRatio() draw
                     if leg.node_size != 0:
                         continue
+                    calls.append(((leg.origin_zone, leg.origin_node,
+                                   leg.dest_zone, leg.dest_node),
+                                  leg.scheduled_departure, veh.demand_type,
+                                  veh.vot, (veh, leg)))
+        else:
+            buckets = {}
+            for agent_id in world.vehicle_order:
+                veh = world.vehicles[agent_id]
+                zone_seq = world.zones[veh.origin_zone].seq_no
+                interval = world.interval_index(veh.departure)
+                buckets.setdefault((zone_seq, interval), []).append(veh)
+            for key in sorted(buckets):
+                for veh in buckets[key]:
+                    if veh.info_type == 0 and veh.node_size >= 2:
+                        continue
+                    if veh.origin_zone == veh.dest_zone:
+                        continue  # intra-zone traffic is not simulated
+                    world.gen_rng.ratio()  # pVeh->GetRandomRatio() draw, unused
+                    if veh.node_size != 0:
+                        continue
+                    calls.append(((veh.origin_zone, veh.origin_node,
+                                   veh.dest_zone, veh.dest_node),
+                                  veh.departure, veh.demand_type,
+                                  veh.vot, (veh, None)))
+        # Phase 2 -- resolve the calls.
+        per_call = []
+        order = []
+        if use_cache:
+            # Distinct keys in first-seen order; a key's path is
+            # computed once, at its first leg's departure, exactly
+            # as the old cache did (the cached value never depended
+            # on departure, demand_type or vot beyond the clamps in
+            # find_best_path, and the first-seen values are passed
+            # through unchanged).
+            first_seen = {}
+            for key, dep, dt, vot, _t in calls:
+                if key not in first_seen:
+                    first_seen[key] = (dep, dt, vot)
+                    order.append(key)
+            self.sp_cache_misses = len(order)
+            self.sp_cache_hits = len(calls) - len(order)
+            tasks = [(key, first_seen[key][0], first_seen[key][1],
+                      first_seen[key][2]) for key in order]
+            resolved = resolve_keys_parallel(world, net, tasks,
+                                             workers)
+            if resolved is None:
+                # Serial fallback (pool not wanted, or any pool
+                # failure): the same keys at the same departures.
+                resolved = {}
+                for key, dep, dt, vot in tasks:
                     node_size, path_links, _ = find_best_path(
-                        world, net, leg.origin_zone, leg.origin_node,
-                        leg.scheduled_departure, leg.dest_zone,
-                        leg.dest_node, veh.demand_type, veh.vot)
-                    if node_size >= 2:
-                        leg.node_size = node_size
-                        leg.link_ary = [VehicleLink(link_no)
-                                        for link_no in path_links]
-                        leg.link_ary.append(VehicleLink(65530))
-                        distance = f32(0)
-                        for link_no in path_links:
-                            distance = f32(distance +
-                                           world.links[link_no].length)
-                        leg.distance = distance
-            # A pathless leg between distinct nodes that still has no
-            # feasible path must fail loud: letting it through would
-            # complete it silently with no travel at all.
+                        world, net, key[0], key[1], dep,
+                        key[2], key[3], dt, vot)
+                    resolved[key] = (node_size, tuple(path_links))
+            per_call = [resolved[key]
+                        for key, _d, _t, _v, _tg in calls]
+        else:
+            # Tripwire tripped: the table is time-varying, so a
+            # key's path depends on its own departure -- no dedup,
+            # no pool, one search per call in walk order, exactly
+            # as before. (No cache report: hits and misses stay 0,
+            # as before.)
+            for key, dep, dt, vot, _t in calls:
+                per_call.append(self._sp_path(
+                    world, net, cache, use_cache,
+                    key[0], key[1], dep, key[2], key[3], dt, vot))
+        # Phase 3 -- assign the resolved paths in the main process,
+        # in first-seen key order; distance is accumulated in path
+        # order exactly as before.
+        if use_cache:
+            by_key = {}
+            for call, res in zip(calls, per_call):
+                by_key.setdefault(call[0], []).append((call, res))
+            ordered = []
+            for key in order:
+                ordered.extend(by_key[key])
+        else:
+            ordered = list(zip(calls, per_call))
+        for (_key, _dep, _dt, _vot, target), (node_size, path_links) \
+                in ordered:
+            veh, leg = target
+            obj = leg if leg is not None else veh
+            if node_size >= 2:
+                obj.node_size = node_size
+                obj.link_ary = [VehicleLink(link_no)
+                                for link_no in path_links]
+                obj.link_ary.append(VehicleLink(65530))
+                distance = f32(0)
+                for link_no in path_links:
+                    distance = f32(distance +
+                                   world.links[link_no].length)
+                obj.distance = distance
+        # Phase 4 -- tour-mode post checks, as before: a pathless
+        # leg between distinct nodes must fail loud, and leg 0's
+        # path is re-mirrored onto the vehicle's working fields.
+        if world.tour_mode:
             for agent_id in world.vehicle_order:
                 veh = world.vehicles[agent_id]
                 for leg in veh.legs:
@@ -95,42 +262,11 @@ class Simulator:
                             % (agent_id, leg.leg_index,
                                world.nodes[leg.origin_node].number,
                                world.nodes[leg.dest_node].number))
-            # Iteration-0 may just have given leg 0 a path; re-mirror
-            # so the vehicle's working fields match leg 0.
             for agent_id in world.vehicle_order:
                 veh = world.vehicles[agent_id]
                 if veh.legs:
                     veh.begin_leg(veh.legs[0])
-            return
-        buckets = {}
-        for agent_id in world.vehicle_order:
-            veh = world.vehicles[agent_id]
-            zone_seq = world.zones[veh.origin_zone].seq_no
-            interval = world.interval_index(veh.departure)
-            buckets.setdefault((zone_seq, interval), []).append(veh)
-        for key in sorted(buckets):
-            for veh in buckets[key]:
-                if veh.info_type == 0 and veh.node_size >= 2:
-                    continue
-                if veh.origin_zone == veh.dest_zone:
-                    continue  # intra-zone traffic is not simulated
-                world.gen_rng.ratio()  # pVeh->GetRandomRatio() draw, unused
-                if veh.node_size != 0:
-                    continue
-                node_size, path_links, _ = find_best_path(
-                    world, net, veh.origin_zone, veh.origin_node,
-                    veh.departure, veh.dest_zone, veh.dest_node,
-                    veh.demand_type, veh.vot)
-                if node_size >= 2:
-                    veh.node_size = node_size
-                    veh.link_ary = [VehicleLink(link_no)
-                                    for link_no in path_links]
-                    veh.link_ary.append(VehicleLink(65530))
-                    distance = f32(0)
-                    for link_no in path_links:
-                        distance = f32(distance +
-                                       world.links[link_no].length)
-                    veh.distance = distance
+        self._report_sp_cache()
 
     # ----- real-time path adjustments -----
 
@@ -197,6 +333,77 @@ class Simulator:
         leg.charger_stop = {"node": site.node_id, "site": site,
                             "done": False,
                             "target_soc": leg.decision_target_soc}
+
+    def _splice_mid_leg_via(self, veh, leg, site, links_to,
+                            links_from, via_time_min):
+        # Liquid-fuel mid-leg splice (v5): replace the rest of the
+        # leg's path from the current node with the via path
+        # current node -> charger -> destination, keeping the
+        # links already travelled (up to and including the
+        # just-completed link, with their arrival stamps). Unlike
+        # _splice_reroute this also sets the en-route stop, the
+        # trip free-flow time, and the leg fields: the leg fields
+        # are read mid-leg by the energy cache and the stop check,
+        # so they must stay in sync now, not only at finish_leg.
+        # sim_link_seq still points at the just-completed link, so
+        # the next link (index sim_link_seq + 1) is the first via
+        # link; soc_deducted_seq, generated, the decision fields,
+        # soc_start_kwh, and veh.soc_kwh are all left alone (no
+        # charge happens at splice time; charge_enroute charges
+        # at the stop).
+        world = self.world
+        links = world.links
+        current_node = links[veh.link_ary[veh.sim_link_seq].link_no] \
+            .to_id
+        if not links_to or not links_from or \
+                links[links_to[0]].from_id != current_node or \
+                links[links_to[-1]].to_id != site.node_id or \
+                links[links_from[0]].from_id != site.node_id or \
+                links[links_from[-1]].to_id != veh.dest_node:
+            raise ProgramStop(
+                "liquid-fuel via path for agent %d leg %d via "
+                "charger %s does not run from its current node to "
+                "its destination" % (veh.agent_id, leg.leg_index,
+                                     site.charger_id))
+        combined = list(links_to) + list(links_from)
+        for a, b in zip(combined, combined[1:]):
+            if links[a].to_id != links[b].from_id:
+                raise ProgramStop(
+                    "liquid-fuel via path for agent %d leg %d via "
+                    "charger %s is not a connected chain"
+                    % (veh.agent_id, leg.leg_index,
+                       site.charger_id))
+        self._store_original_path(veh)
+        kept = [entry.link_no
+                for entry in veh.link_ary[:veh.sim_link_seq + 1]]
+        stamps = [entry.abs_arrival
+                  for entry in veh.link_ary[:veh.sim_link_seq + 1]]
+        full = kept + combined
+        veh.node_size = len(full) + 1
+        veh.link_ary = []
+        distance = f32(0)
+        trip_fftt = f32(0)
+        for i, link_no in enumerate(full):
+            entry = VehicleLink(link_no)
+            entry.abs_arrival = stamps[i] if i < len(stamps) \
+                else f32(0)
+            veh.link_ary.append(entry)
+            distance = f32(distance + links[link_no].length)
+            trip_fftt = f32(trip_fftt + links[link_no].fftt)
+        veh.link_ary.append(VehicleLink(65530))
+        veh.distance = distance
+        veh.trip_fftt = trip_fftt
+        leg.link_ary = veh.link_ary
+        leg.node_size = veh.node_size
+        leg.distance = veh.distance
+        leg.trip_fftt = veh.trip_fftt
+        leg.charger_stop = {"node": site.node_id, "site": site,
+                            "done": False,
+                            "target_soc": leg.enroute_target_soc}
+        leg.enroute_via = (links_to, links_from, via_time_min)
+        leg.trigger = "liquid"
+        leg.trigger_charger_id = site.charger_id
+        leg.liquid_fired = True
 
     def _store_original_path(self, veh):
         # Keep the FIRST original: a later adjustment (e.g. an
@@ -369,7 +576,9 @@ class Simulator:
     def network_loading(self):
         world = self.world
         for link in world.links:
-            link.setup_loading(world.horizon)
+            link.setup_loading(world.horizon, world.min_inflow_ratio)
+        self.freeway_links = [link for link in world.links
+                              if "f" in link.type_code]
         world.info_updating_flag = False
         for agent_id in world.vehicle_order:
             veh = world.vehicles[agent_id]
@@ -381,7 +590,17 @@ class Simulator:
             veh.complete = False
             veh.delay = f32(0)
             if veh.info_type >= 2:
-                world.info_updating_flag = True
+                # Fail loud: info-updating agents would switch on the
+                # info-updating block in step() (per-link exit-queue
+                # walk plus update_current_travel_time every minute),
+                # a catastrophic silent slowdown on a full-week run.
+                # The converter writes info_type 1 for every agent,
+                # so this never fires on a real run; anything else is
+                # a bad input, not a case to simulate slowly.
+                raise ProgramStop(
+                    "agent %d has info_type %d: info-updating "
+                    "agents (info_type >= 2) are not supported in "
+                    "this build" % (agent_id, veh.info_type))
         self.generated = 0
         self.completed = 0
         # rebuild the time-dependent departure lists from the original map,
@@ -632,9 +851,91 @@ class Simulator:
             link.departure_based_tt + travel_time)
         leg.tow = True
         leg.tow_count += 1
+        # A tow counts as the leg's one diversion: no liquid
+        # re-trigger on the charger -> destination drive.
+        leg.liquid_fired = True
         leg.depleted = False
         veh.soc_kwh = plan["target_kwh"]
         return True
+
+    def _plan_ahead_trigger(self, veh, leg, d_next):
+        # Plan-ahead trigger (v5), called from _complete_leg after
+        # the dwell charge and before the next-leg SoC sync. When
+        # the post-charge SoC cannot cover the remaining legs, the
+        # nearest reachable charger is planned: a pending via on
+        # the first non-intrazonal later leg (applied at trigger,
+        # effective on next departure -- the next leg routes via
+        # the charger when it generates), or a forced dwell charge
+        # when the charger is AT the arrival node. A charger at
+        # the next leg's destination needs no detour and records
+        # nothing. The last leg of a tour never triggers (nothing
+        # remains to plan for).
+        engine = getattr(self.world, "charging_engine", None)
+        if engine is None or veh.complete:
+            return
+        if leg.archetype != "plan_ahead":
+            return
+        if leg.stranded or leg.depleted or leg.charger_stop is not None:
+            return
+        if leg.node_size < 2:
+            return
+        params = self.world.ev_params(veh)
+        if params is None:
+            return
+        battery, consumption = params
+        later = veh.legs[veh.current_leg:]
+        remaining = 0.0
+        for later_leg in later:
+            remaining += engine._leg_energy(self.world, later_leg,
+                                            consumption)
+        if remaining <= 0:
+            return
+        if not veh.soc_kwh < remaining:
+            return
+        target_leg = None
+        for later_leg in later:
+            if later_leg.origin_node != later_leg.dest_node:
+                target_leg = later_leg
+                break
+        if target_leg is None:
+            return
+        from .decision import choose_charger_for_trigger
+        departure = d_next if d_next is not None \
+            else float(leg.arrival_actual)
+        found = choose_charger_for_trigger(
+            engine.nearest_map, "plan_ahead", leg.dest_node,
+            target_leg.dest_node, veh.soc_kwh, consumption, battery,
+            target_leg.enroute_target_soc, world=self.world,
+            ff_net=engine._ff_net(), veh=veh, departure=departure)
+        if found is None:
+            return
+        site, links_to, links_from, via_time = found
+        if site.node_id == target_leg.dest_node:
+            # Charger IS the next leg's destination: no detour
+            # needed, no record; the next leg's generation-time
+            # v4 rules handle charging at arrival.
+            return
+        if site.node_id == leg.dest_node:
+            # Charger AT the arrival node: forced dwell charge,
+            # unless a dwell charge already ran there (its
+            # outcome already reflects the post-charge SoC, and
+            # the dwell window is exhausted either way).
+            if leg.decision == "destination" and \
+                    leg.charge_outcome in ("charged-partial",
+                                           "charged-destination",
+                                           "at-target"):
+                return
+            engine.charge_at_site_during_dwell(
+                self.world, veh, leg, site,
+                float(leg.arrival_actual), d_next,
+                target_leg.enroute_target_soc)
+            leg.trigger = "plan_ahead"
+            leg.trigger_charger_id = site.charger_id
+            return
+        target_leg.pending_via = (site, links_to, links_from,
+                                  via_time)
+        leg.trigger = "plan_ahead"
+        leg.trigger_charger_id = site.charger_id
 
     def _complete_leg(self, veh, current_time, step_no):
         # Destination reached: snapshot the leg, count the leg
@@ -678,6 +979,13 @@ class Simulator:
                 engine.apply_destination_charge(
                     self.world, veh, leg, float(leg.arrival_actual),
                     d_next)
+            # Plan-ahead trigger (v5): on arrival, check the
+            # post-dwell-charge SoC against the energy of the
+            # remaining legs. Runs after the dwell charge above
+            # (a dwell charge may fix the shortfall) and before
+            # the next leg's SoC sync below (a forced charge at
+            # this node must be visible to it).
+            self._plan_ahead_trigger(veh, leg, d_next)
             if not veh.complete and veh.legs and \
                     veh.current_leg < len(veh.legs):
                 veh.legs[veh.current_leg].soc_start_kwh = veh.soc_kwh
@@ -934,21 +1242,28 @@ class Simulator:
                 else:
                     break
 
-        # stage 3: link in/out capacities (Newell only)
+        # stage 3: link in/out capacities (Newell only). Plain-float
+        # arithmetic on the per-link constants precomputed in
+        # link.setup_loading (link.s3_consts); f32() is re-applied
+        # only at the two non-f32 inputs, f_in before the cum-in add
+        # and the ring+jam add for n_allow. Exactness: a double add
+        # of two float32 values is exact here (the addends span at
+        # most ~48 significand bits, under the 53-bit double), so the
+        # one f32() rounding equals the one float32 add it replaces;
+        # f32(min(x, y)) with x float32 is likewise exact by the
+        # monotonicity of rounding. Accumulation order is unchanged.
         relax = current_time >= world.end + 60
         for link in links:
-            per_hour = link.lane_capacity
-            per_interval = float(per_hour) * SIM_INTERVAL / 60.0 * \
-                float(link.outflow_lanes)
-            capacity = f32(per_interval)
-            if relax:
-                capacity = f32(capacity * f32(3))
-            link.cum_out_counter = f32(link.cum_out_counter + capacity)
+            cap, cap_relax, inflow_cap, jam, inflow_rate = \
+                link.s3_consts
+            capacity = cap_relax if relax else cap
+            link.cum_out_counter = f32(float(link.cum_out_counter) + \
+                                     capacity)
             link.link_out_capacity = int(link.cum_out_counter) - \
                 link.cum_out_prev
             link.cum_out_prev += link.link_out_capacity
             on_link = link.cflow_arrival - link.cflow_departure
-            f_in = f32(99999.0)
+            f_in = 99999.0
             # Space-capacity inflow limiting applies to freeway
             # links only. The old signal-model gate is gone: with no
             # signal model, this build keeps the default behaviour
@@ -956,30 +1271,27 @@ class Simulator:
             # previously set signal_model = 2 will see different
             # arterial inflow behaviour.
             if "f" in link.type_code:
-                available = f32(link.space_capacity - f32(on_link))
-                inflow_cap = 1800 * SIM_INTERVAL / 60.0 * \
-                    float(link.inflow_lanes)
-                f_in = f32(min(float(available), inflow_cap))
+                f_in = min(float(link.space_capacity) - on_link,
+                         inflow_cap)
                 if f_in < 0:
-                    f_in = f32(0)
+                    f_in = 0.0
                 if step_no >= link.backward_wave_steps:
                     slot = max(0, step_no - link.backward_wave_steps) % 300
-                    jam = f32(f32(link.length *
-                                  f32(link.outflow_lanes)) * link.k_jam)
-                    n_allow = int(f32(link.ring_departure[slot] + jam))
+                    n_allow = int(f32(float(link.ring_departure[slot]) + \
+                                  jam))
                     prev_slot = max(0, step_no - 1) % 300
                     flow_allowed = n_allow - int(link.ring_arrival[
                         prev_slot])
                     if flow_allowed < 0:
                         flow_allowed = 0
                     if f_in > flow_allowed:
-                        f_in = f32(flow_allowed)
-                inflow_rate = f32(per_interval) * world.min_inflow_ratio
+                        f_in = float(flow_allowed)
                 if relax:
-                    inflow_rate = f32(per_interval)
+                    inflow_rate = cap
                 if f_in < inflow_rate:
                     f_in = inflow_rate
-            link.cum_in_counter = f32(link.cum_in_counter + f_in)
+            link.cum_in_counter = f32(float(link.cum_in_counter) + \
+                                    f32(f_in))
             link.link_in_capacity = int(link.cum_in_counter) - \
                 link.cum_in_prev
             link.cum_in_prev += link.link_in_capacity
@@ -1017,9 +1329,16 @@ class Simulator:
         # stage 4: node transfer
         self._node_transfer(current_time, step_no)
 
-        # stage 5: ring buffers for Newell's backward wave
+        # stage 5: ring buffers for Newell's backward wave. Only
+        # freeway links are read (stage-3 freeway branch), so only
+        # they need their ring written; the Swedish network writes
+        # every link as freeway type, so this saves ~0 there.
         slot = step_no % 300
-        for link in links:
+        freeway_links = self.freeway_links
+        if freeway_links is None:
+            freeway_links = self.freeway_links = \
+                [link for link in links if "f" in link.type_code]
+        for link in freeway_links:
             link.ring_arrival[slot] = f32(link.cflow_arrival)
             link.ring_departure[slot] = f32(link.cflow_departure)
 
@@ -1035,7 +1354,9 @@ class Simulator:
             count = 0
             while count < size:
                 link = links[incoming[sequence]]
-                self._discharge_link(link, node, current_time, step_no)
+                if link.exit_queue:
+                    self._discharge_link(link, node, current_time,
+                                         step_no)
                 count += 1
                 sequence = (sequence + 1) % size
 
@@ -1112,6 +1433,66 @@ class Simulator:
                 vehicle_out_count -= 1
                 continue
             if seq < number_of_links - 1:
+                # Liquid-fuel trigger (v5): after the per-link
+                # deduction and the tow attempt, before the user
+                # reroute callback. Fires at most once per leg,
+                # when the post-deduction SoC drops below the leg's
+                # threshold. A splice sets rerouted (the callback
+                # is skipped for this transition); a charger at
+                # the current node parks in place instead, and the
+                # existing en-route stop check below charges it
+                # in this same discharge call.
+                rerouted = False
+                if leg is not None and leg.archetype == "liquid" \
+                        and not leg.liquid_fired \
+                        and not leg.stranded and not leg.depleted \
+                        and leg.charger_stop is None \
+                        and leg.node_size >= 2:
+                    engine = getattr(world, "charging_engine", None)
+                    params = world.ev_params(veh) \
+                        if engine is not None else None
+                    if params is not None:
+                        battery, consumption = params
+                        if veh.soc_kwh < leg.soc_threshold_frac \
+                                * battery:
+                            from .decision import \
+                                choose_charger_for_trigger
+                            found = choose_charger_for_trigger(
+                                engine.nearest_map, "liquid",
+                                link.to_id, veh.dest_node,
+                                veh.soc_kwh, consumption, battery,
+                                leg.enroute_target_soc, world=world,
+                                ff_net=engine._ff_net(), veh=veh,
+                                departure=float(arrival))
+                            leg.liquid_fired = True
+                            if found is not None:
+                                site, links_to, links_from, \
+                                    via_time = found
+                                if site.node_id == veh.dest_node:
+                                    # Charger IS the destination:
+                                    # driving straight there anyway,
+                                    # no splice, no record.
+                                    pass
+                                elif site.node_id == link.to_id:
+                                    # Charger AT the current node:
+                                    # park in place (no splice); the
+                                    # en-route stop check below runs
+                                    # charge_enroute in this call.
+                                    leg.charger_stop = {
+                                        "node": site.node_id,
+                                        "site": site, "done": False,
+                                        "target_soc":
+                                            leg.enroute_target_soc}
+                                    leg.trigger = "liquid"
+                                    leg.trigger_charger_id = \
+                                        site.charger_id
+                                else:
+                                    self._splice_mid_leg_via(
+                                        veh, leg, site, links_to,
+                                        links_from, via_time)
+                                    rerouted = True
+                                    number_of_links = \
+                                        veh.node_size - 1
                 # Mid-run reroute hook (charging fork): the vehicle has
                 # just completed this link and is at its to-node. A
                 # user callback may replace the rest of its path from
@@ -1120,9 +1501,8 @@ class Simulator:
                 # a returned chain starts at the arrival node. Without
                 # a callback, or when it returns None, the preassigned
                 # path stands.
-                rerouted = False
                 arrival_node = link.to_id
-                if arrival_node != veh.dest_node and \
+                if arrival_node != veh.dest_node and not rerouted and \
                         world.reroute_callback is not None:
                     new_links = world.reroute_callback(
                         veh, arrival_node, world)

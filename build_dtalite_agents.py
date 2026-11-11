@@ -43,9 +43,20 @@
 #   home_charger is joined from file 3 by person (0 if absent);
 #   vehicle_type from file 4 car class by person: B -> 1 (40 kWh),
 #   C -> 2 (60 kWh), D -> 3 (100 kWh), default 1 if absent.
-#   archetype is blank (names are pending Eli + David); the
-#   enroute_target_soc is 0.8 for every leg; path_node_sequence is
-#   empty, so PySim assigns a free-flow shortest path at departure.
+#   archetype is one of "liquid", "plan_ahead", "opportunistic",
+#   drawn once per agent from --archetype-mix (default even thirds)
+#   with a seeded stdlib random draw, and is the same on every leg
+#   of that agent. The per-agent liquid-fuel SoC threshold (fraction
+#   of battery, uniform in [--liquid-threshold-lo,
+#   --liquid-threshold-hi], default 0.10-0.30) and walking tolerance
+#   (metres, uniform in [--walk-tolerance-lo, --walk-tolerance-hi],
+#   default 100-1000) are drawn the same way, in the fixed order
+#   archetype, threshold, tolerance, so a given --seed reproduces
+#   the file byte-identically. The sim loader reads
+#   soc_threshold_frac (default 0.20) and walk_tolerance_m (default
+#   500.0) when the columns are present. The enroute_target_soc is
+#   0.8 for every leg; path_node_sequence is empty, so PySim assigns
+#   a free-flow shortest path at departure.
 #
 # Only the csv module and numpy are needed (scipy is used for
 # snapping when importable, with a chunked numpy fallback otherwise).
@@ -55,9 +66,13 @@
 # Usage:
 #   python build_dtalite_agents.py [--plans PATH] [--home PATH]
 #       [--fleet PATH] [--nodes PATH] [--out DIR] [--days N]
+#       [--archetype-mix liquid,plan_ahead,opportunistic] [--seed N]
+#       [--liquid-threshold-lo F] [--liquid-threshold-hi F]
+#       [--walk-tolerance-lo F] [--walk-tolerance-hi F]
 import argparse
 import csv
 import os
+import random
 import sys
 from collections import Counter
 from pathlib import Path
@@ -80,6 +95,7 @@ AGENT_HEADER = [
     "agent_id", "leg_index", "from_origin_node_id",
     "to_destination_node_id", "departure_time_in_min", "departure_mode",
     "dwell_min", "trip_purpose", "archetype", "enroute_target_soc",
+    "soc_threshold_frac", "walk_tolerance_m",
     "home_charger", "vehicle_type", "demand_type", "information_type",
     "value_of_time", "vehicle_age", "tour_id", "path_node_sequence",
     "from_zone_id", "to_zone_id",
@@ -115,6 +131,29 @@ def find_nodes(here, given):
     raise SystemExit(
         "input_node.csv not found (looked in dtalite_inputs/ next to "
         "this script); pass --nodes PATH")
+
+
+ARCHETYPES = ("liquid", "plan_ahead", "opportunistic")
+
+
+def parse_archetype_mix(text):
+    # "liquid,plan_ahead,opportunistic" in that order; normalised
+    # to sum 1.0. Fails loud on anything that is not three
+    # non-negative numbers with a positive sum.
+    try:
+        values = [float(part) for part in text.split(",")]
+    except ValueError:
+        raise SystemExit("--archetype-mix must be three numbers: %r"
+                         % (text,))
+    if len(values) != 3:
+        raise SystemExit("--archetype-mix needs exactly 3 values, "
+                         "got %d" % len(values))
+    if any(value < 0 for value in values):
+        raise SystemExit("--archetype-mix values must be >= 0")
+    total = sum(values)
+    if total <= 0:
+        raise SystemExit("--archetype-mix values must sum to > 0")
+    return tuple(value / total for value in values)
 
 
 def _num(value):
@@ -253,7 +292,8 @@ def read_plans(path):
     return persons, counts
 
 
-def build_legs(person, acts, days, home_charger, vehicle_type):
+def build_legs(person, acts, days, home_charger, vehicle_type,
+               archetype, threshold, tolerance):
     # Flat week chain: the day's activities repeated days times.
     # Returns the leg rows (as dicts) for one person, validated.
     n_day = len(acts)
@@ -295,7 +335,8 @@ def build_legs(person, acts, days, home_charger, vehicle_type):
                                ("home", "work") else "dwell"),
             "dwell_min": run_dwell,
             "trip_purpose": act_b["purpose"],
-            "archetype": "", "enroute_target_soc": ENROUTE_TARGET_SOC,
+            "archetype": archetype, "enroute_target_soc": ENROUTE_TARGET_SOC,
+            "soc_threshold_frac": threshold, "walk_tolerance_m": tolerance,
             "home_charger": home_charger, "vehicle_type": vehicle_type,
             "demand_type": DEMAND_TYPE,
             "information_type": INFORMATION_TYPE,
@@ -348,9 +389,45 @@ def main():
                     "this script)")
     ap.add_argument("--days", type=int, default=7,
                     help="days to repeat the weekday plan (default 7)")
+    ap.add_argument("--archetype-mix", default=None,
+                    help="archetype mix as liquid,plan_ahead,opportunistic "
+                    "shares, normalised to sum 1 (default even thirds)")
+    ap.add_argument("--seed", type=int, default=42,
+                    help="seed for the per-agent archetype/threshold/"
+                    "tolerance draws (default 42)")
+    ap.add_argument("--liquid-threshold-lo", type=float, default=0.10,
+                    help="liquid-fuel SoC threshold low end, fraction "
+                    "of battery (default 0.10)")
+    ap.add_argument("--liquid-threshold-hi", type=float, default=0.30,
+                    help="liquid-fuel SoC threshold high end, fraction "
+                    "of battery (default 0.30)")
+    ap.add_argument("--walk-tolerance-lo", type=float, default=100.0,
+                    help="walking tolerance low end, metres "
+                    "(default 100)")
+    ap.add_argument("--walk-tolerance-hi", type=float, default=1000.0,
+                    help="walking tolerance high end, metres "
+                    "(default 1000)")
     args = ap.parse_args()
     if args.days < 1:
         raise SystemExit("--days must be >= 1")
+    if args.archetype_mix is None:
+        mix_given = (1.0 / 3, 1.0 / 3, 1.0 / 3)
+        mix = mix_given
+    else:
+        mix = parse_archetype_mix(args.archetype_mix)
+        mix_given = tuple(float(part) for part in
+                          args.archetype_mix.split(","))
+    if args.liquid_threshold_lo > args.liquid_threshold_hi:
+        raise SystemExit("--liquid-threshold-lo must be <= "
+                         "--liquid-threshold-hi")
+    if not 0 <= args.liquid_threshold_lo <= 1 or \
+            not 0 <= args.liquid_threshold_hi <= 1:
+        raise SystemExit("--liquid-threshold-lo/hi must be in [0, 1]")
+    if args.walk_tolerance_lo > args.walk_tolerance_hi:
+        raise SystemExit("--walk-tolerance-lo must be <= "
+                         "--walk-tolerance-hi")
+    if args.walk_tolerance_lo < 0 or args.walk_tolerance_hi < 0:
+        raise SystemExit("--walk-tolerance-lo/hi must be >= 0")
     plans_path = find_input(here, args.plans, "*activity_plans.csv",
                             "plans")
     home_path = find_input(here, args.home, "*home_charger_access.csv",
@@ -394,6 +471,11 @@ def main():
                       file=sys.stderr)
                 snap_warned += 1
 
+    rng = random.Random(args.seed)
+    archetype_counts = Counter()
+    drawn_thresholds = []
+    drawn_tolerances = []
+
     agent_path = out_dir / "input_agent.csv"
     # Write to a temp file and move it into place only on success, so
     # a failure halfway through (a bad row for a later person) never
@@ -420,8 +502,28 @@ def main():
                               file=sys.stderr)
                         fleet_warned += 1
                 vehicle_type = fleet.get(person, 1)
+                # Fixed draw order per person (archetype, then
+                # threshold, then tolerance) and one draw set per
+                # person regardless of archetype: the stream stays
+                # aligned when the mix changes, so a seed reproduces
+                # the file byte-identically.
+                draw = rng.random()
+                if draw < mix[0]:
+                    archetype = "liquid"
+                elif draw < mix[0] + mix[1]:
+                    archetype = "plan_ahead"
+                else:
+                    archetype = "opportunistic"
+                threshold = rng.uniform(args.liquid_threshold_lo,
+                                        args.liquid_threshold_hi)
+                tolerance = rng.uniform(args.walk_tolerance_lo,
+                                        args.walk_tolerance_hi)
+                archetype_counts[archetype] += 1
+                drawn_thresholds.append(threshold)
+                drawn_tolerances.append(tolerance)
                 legs = build_legs(person, acts, args.days, home_charger,
-                                  vehicle_type)
+                                  vehicle_type, archetype, threshold,
+                                  tolerance)
                 for leg in legs:
                     writer.writerow([
                         leg["agent_id"], leg["leg_index"],
@@ -430,7 +532,10 @@ def main():
                         _num(leg["departure_time_in_min"]),
                         leg["departure_mode"], _num(leg["dwell_min"]),
                         leg["trip_purpose"], leg["archetype"],
-                        leg["enroute_target_soc"], leg["home_charger"],
+                        leg["enroute_target_soc"],
+                        "%.4f" % leg["soc_threshold_frac"],
+                        "%.1f" % leg["walk_tolerance_m"],
+                        leg["home_charger"],
                         leg["vehicle_type"], leg["demand_type"],
                         leg["information_type"], leg["value_of_time"],
                         leg["vehicle_age"], leg["tour_id"],
@@ -483,6 +588,24 @@ def main():
         for vtype, _, _, _, _, _ in VEHICLE_TYPES))
     print("persons missing from fleet file: %d, missing from home "
           "charger file: %d" % (len(missing_fleet), len(missing_home)))
+    print("seed: %d" % args.seed)
+    print("archetype mix given: " + ", ".join(
+        "%s %.4f" % (name, value)
+        for name, value in zip(ARCHETYPES, mix_given)))
+    print("archetype mix normalised: " + ", ".join(
+        "%s %.4f" % (name, value)
+        for name, value in zip(ARCHETYPES, mix)))
+    n_agents = max(1, sum(archetype_counts.values()))
+    print("archetypes: " + ", ".join(
+        "%s %d (%.1f%%)" % (name, archetype_counts[name],
+                            100.0 * archetype_counts[name] / n_agents)
+        for name in ARCHETYPES))
+    if drawn_thresholds:
+        print("soc_threshold_frac drawn: min %.4f, max %.4f"
+              % (min(drawn_thresholds), max(drawn_thresholds)))
+    if drawn_tolerances:
+        print("walk_tolerance_m drawn: min %.1f, max %.1f"
+              % (min(drawn_tolerances), max(drawn_tolerances)))
     return 0
 
 
