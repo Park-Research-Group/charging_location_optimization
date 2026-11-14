@@ -269,14 +269,19 @@ def resolve_workers(workers, n_keys):
     return int(workers)
 
 
-def resolve_keys_parallel(world, net, tasks, workers):
+def resolve_keys_parallel(world, net, tasks, workers, on_key=None):
     # Resolve distinct iteration-0 SP keys in a spawn Pool.
     # tasks is [(key, departure, demand_type, vot), ...] in
     # first-seen order, key = (origin_zone, origin, dest_zone,
     # dest). Returns {key: (node_size, path_tuple)}, or None when
     # the pool should not or could not be used: the caller then
     # resolves the same tasks serially, so a pool failure never
-    # fails a run that would have worked serially.
+    # fails a run that would have worked serially. on_key, when
+    # given, is called once per result received, in the main
+    # process's imap_unordered loop (a counter increment only;
+    # it cannot change pool behaviour, ordering or results, and
+    # an exception in it is swallowed here so it cannot kill
+    # the pool).
     if not tasks:
         return {}
     n_workers = resolve_workers(workers, len(tasks))
@@ -312,6 +317,11 @@ def resolve_keys_parallel(world, net, tasks, workers):
         for oz, o, dz, d, node_size, path in pool.imap_unordered(
                 _sp_worker, jobs, chunksize=1):
             results[(oz, o, dz, d)] = (node_size, path)
+            if on_key is not None:
+                try:
+                    on_key()
+                except Exception:
+                    pass
         ok = True
     except Exception:
         ok = False

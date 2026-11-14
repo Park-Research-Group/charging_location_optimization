@@ -16,7 +16,8 @@ from .run import run_loading
 
 
 def run_pysim(input_dir, output_dir, verbose=False, reroute_callback=None,
-              charging=None, workers=None):
+              charging=None, workers=None, incremental=True,
+              progress=True, flush_legs=None, flush_sim_minutes=None):
     """Run one PySim loading pass.
 
     input_dir is a directory holding DTALite-format input files. It is
@@ -58,6 +59,14 @@ def run_pysim(input_dir, output_dir, verbose=False, reroute_callback=None,
     (spawn re-imports the calling script); `python -m pysim.run`
     already satisfies this.
 
+    incremental (default True) writes the output files as legs
+    complete, so a killed run leaves usable partial files plus
+    run_progress.json (see the README v8 section); False restores
+    exact v7 behaviour, all writers end-of-run. progress is the
+    console-bar switch (the bar is display only); the progress
+    file is written either way. flush_legs / flush_sim_minutes
+    tune the flush cadence (defaults 10000 legs / 60 sim-minutes).
+
     Returns a dict with the input/output dirs, the output paths, the
     agent counts, and the charging summary (or None). Raises ProgramStop
     (from pysim.cpp) on out-of-scope scenarios: flow models other than
@@ -73,11 +82,18 @@ def run_pysim(input_dir, output_dir, verbose=False, reroute_callback=None,
         print("pysim: %s -> %s" % (input_dir, output_dir))
     world = run_loading(input_dir, output_dir,
                         reroute_callback=reroute_callback,
-                        charging=charging, workers=workers)
+                        charging=charging, workers=workers,
+                        incremental=incremental, progress=progress,
+                        flush_legs=flush_legs,
+                        flush_sim_minutes=flush_sim_minutes)
     agents = len(world.vehicles)
     completed = sum(1 for veh in world.vehicles.values() if veh.complete)
     outputs = {
         "agent": os.path.join(output_dir, "output_agent.csv"),
+        # v8: the run-progress file (run_progress.json) is written
+        # on every run, incremental or not; see the README v8
+        # section for its fields and the killed-run signature.
+        "progress": os.path.join(output_dir, "run_progress.json"),
     }
     if world.charging_summary is not None:
         outputs["charging"] = os.path.join(output_dir,

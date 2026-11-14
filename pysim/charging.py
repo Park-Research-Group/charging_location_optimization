@@ -873,19 +873,29 @@ class ChargingEngine:
                               0.0, 0.0))
         leg.stranded_rows_recorded += 1
 
-    def finalize(self, world, output_dir):
-        _write_events(output_dir, self.events, tour=True)
+    def finalize_summary(self, world, output_dir):
+        # Summary only: the incremental path calls this after the
+        # event / stranded / decision files are already on disk,
+        # so a killed run has no summary file (the summary is a
+        # pure function of the full event set; see the README).
+        # Kept separate from finalize so the legacy post-pass and
+        # the --no-incremental path keep the old all-four behaviour.
         _write_summary(world, output_dir, self.sites,
                        home_events=self.home_events,
                        home_power_kw=self.config["home_power_kw"])
-        _write_stranded(output_dir, self.stranded, tour=True)
-        _write_decisions(output_dir, world, self)
         return {
             "charges": len(self.events),
             "stranded": len(self.stranded),
             "sites": len(self.sites),
             "total_energy_kwh": sum(e[8] for e in self.events),
         }
+
+    def finalize(self, world, output_dir):
+        _write_events(output_dir, self.events, tour=True)
+        summary = self.finalize_summary(world, output_dir)
+        _write_stranded(output_dir, self.stranded, tour=True)
+        _write_decisions(output_dir, world, self)
+        return summary
 
 
 def run_charging(world, output_dir, config):
@@ -975,22 +985,104 @@ def run_charging(world, output_dir, config):
     return summary
 
 
-def _write_events(output_dir, events, tour=False):
-    header = "agent_id,tour_id,charger_id,node_id,arrival_time_in_min," \
-        "wait_in_min,charge_start_in_min,charge_end_in_min," \
-        "energy_kwh,soc_before_kwh,soc_after_kwh,charger_power_kw"
+CHARGING_HEADER = "agent_id,tour_id,charger_id,node_id,arrival_time_in_min," \
+    "wait_in_min,charge_start_in_min,charge_end_in_min," \
+    "energy_kwh,soc_before_kwh,soc_after_kwh,charger_power_kw"
+CHARGING_HEADER_TOUR = CHARGING_HEADER + ",leg_index,charged_en_route,tow_charge"
+STRANDED_HEADER = "agent_id,tour_id,stranded_node_id,trip_energy_kwh," \
+    "soc_start_kwh"
+STRANDED_HEADER_TOUR = STRANDED_HEADER + \
+    ",leg_index,tow_charger_id,tow_start_in_min," \
+    "tow_end_in_min,charge_kwh,tow_blockage_link," \
+    "tow_blockage_start_in_min,tow_blockage_duration_min"
+DECISIONS_HEADER_NARROW = "agent_id,leg_index,day,soc_at_departure_kwh," \
+    "leg_energy_kwh,remaining_energy_kwh," \
+    "destination_charger,decision,enroute_charger_id," \
+    "target_soc,outcome"
+DECISIONS_HEADER_WIDE = DECISIONS_HEADER_NARROW + \
+    ",trigger,trigger_charger_id"
+
+
+def _format_event_row(event, tour):
+    # One charging event row, exactly as _write_events renders it.
+    # Events are immutable tuples, so rendering at drain time and
+    # at the end of the run produce the same bytes.
     if tour:
-        header += ",leg_index,charged_en_route,tow_charge"
+        return "%d,%d,%s,%d,%.2f,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.1f," \
+            "%d,%d,%d\n" % event
+    return "%d,%d,%s,%d,%.2f,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.1f\n" % event
+
+
+def _format_stranded_row(row, tour):
+    # One stranded row, exactly as _write_stranded renders it.
+    if tour:
+        return "%d,%d,%d,%.3f,%.3f,%d,%s,%.2f,%.2f,%.3f," \
+            "%s,%.2f,%.2f\n" % row
+    return "%d,%d,%d,%.3f,%.3f\n" % row
+
+
+def _any_trigger(world):
+    # True when at least one leg in the run recorded a trigger.
+    # The decisions header carries the trigger columns only then.
+    for veh in world.vehicles.values():
+        for leg in veh.legs:
+            if leg.trigger:
+                return True
+    return False
+
+
+def _format_decision_row(world, veh, leg, has_trigger, engine=None):
+    # One decision row, exactly as _write_decisions renders it.
+    # has_trigger selects the wide (trigger columns present) or
+    # narrow layout; the incremental writer always passes True and
+    # strips the columns at the end of a triggerless run. engine
+    # defaults to the world's charging engine.
+    if engine is None:
+        engine = getattr(world, "charging_engine", None)
+    departed = leg.complete or leg.departure_actual is not None
+    actual_dep = leg.departure_actual if departed \
+        else float(leg.scheduled_departure)
+    day = int(actual_dep // 1440)
+    dest_charger = 1 if (engine.by_node.get(leg.dest_node)
+                         or engine._home_available(veh, leg)) \
+        else 0
+    enroute_id = leg.decision_charger_id \
+        if leg.decision == "enroute" else ""
+    if leg.stranded:
+        outcome = "stranded"
+    elif leg.charge_outcome == "queued-out":
+        outcome = "queued-out"
+    elif leg.charge_outcome == "charged-partial":
+        outcome = "charged-partial"
+    elif leg.charge_outcome == "charged-destination":
+        outcome = "charged-destination"
+    elif leg.charge_outcome == "at-target":
+        outcome = "at-target"
+    else:
+        outcome = "completed"
+    if has_trigger:
+        return "%d,%d,%d,%.3f,%.3f,%.3f,%d,%s,%s,%.3f,%s,%s,%s\n" \
+            % (veh.agent_id, leg.leg_index, day,
+               float(leg.soc_start_kwh),
+               float(leg.decision_leg_energy_kwh),
+               float(leg.decision_remaining_kwh), dest_charger,
+               leg.decision, enroute_id,
+               float(leg.decision_target_soc), outcome,
+               leg.trigger, leg.trigger_charger_id)
+    return "%d,%d,%d,%.3f,%.3f,%.3f,%d,%s,%s,%.3f,%s\n" \
+        % (veh.agent_id, leg.leg_index, day,
+           float(leg.soc_start_kwh),
+           float(leg.decision_leg_energy_kwh),
+           float(leg.decision_remaining_kwh), dest_charger,
+           leg.decision, enroute_id,
+           float(leg.decision_target_soc), outcome)
+
+
+def _write_events(output_dir, events, tour=False):
+    header = CHARGING_HEADER_TOUR if tour else CHARGING_HEADER
     lines = [header + "\n"]
     for e in events:
-        if tour:
-            lines.append(
-                "%d,%d,%s,%d,%.2f,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.1f,"
-                "%d,%d,%d\n" % e)
-        else:
-            lines.append(
-                "%d,%d,%s,%d,%.2f,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.1f\n"
-                % e)
+        lines.append(_format_event_row(e, tour))
     with open(os.path.join(output_dir, "output_charging.csv"),
               "w", newline="", encoding="utf-8") as fh:
         fh.writelines(lines)
@@ -1040,20 +1132,10 @@ def _write_summary(world, output_dir, sites, home_events=None,
 
 
 def _write_stranded(output_dir, stranded, tour=False):
-    header = "agent_id,tour_id,stranded_node_id,trip_energy_kwh," \
-        "soc_start_kwh"
-    if tour:
-        # Tow fields are empty / 0.0 when the leg was not towed.
-        header += ",leg_index,tow_charger_id,tow_start_in_min," \
-            "tow_end_in_min,charge_kwh,tow_blockage_link," \
-            "tow_blockage_start_in_min,tow_blockage_duration_min"
+    header = STRANDED_HEADER_TOUR if tour else STRANDED_HEADER
     lines = [header + "\n"]
     for row in stranded:
-        if tour:
-            lines.append("%d,%d,%d,%.3f,%.3f,%d,%s,%.2f,%.2f,%.3f,"
-                         "%s,%.2f,%.2f\n" % row)
-        else:
-            lines.append("%d,%d,%d,%.3f,%.3f\n" % row)
+        lines.append(_format_stranded_row(row, tour))
     with open(os.path.join(output_dir, "output_stranded.csv"),
               "w", newline="", encoding="utf-8") as fh:
         fh.writelines(lines)
@@ -1067,63 +1149,15 @@ def _write_decisions(output_dir, world, engine):
     # v5: trigger columns appear only when at least one leg in
     # the run recorded a trigger, so blank-archetype runs stay
     # byte-identical to v4.
-    has_trigger = False
-    for veh in world.vehicles.values():
-        for leg in veh.legs:
-            if leg.trigger:
-                has_trigger = True
-                break
-        if has_trigger:
-            break
-    lines = ["agent_id,leg_index,day,soc_at_departure_kwh,"
-             "leg_energy_kwh,remaining_energy_kwh,"
-             "destination_charger,decision,enroute_charger_id,"
-             "target_soc,outcome"
-             + (",trigger,trigger_charger_id" if has_trigger else "")
-             + "\n"]
+    has_trigger = _any_trigger(world)
+    header = DECISIONS_HEADER_WIDE if has_trigger \
+        else DECISIONS_HEADER_NARROW
+    lines = [header + "\n"]
     for agent_id in sorted(world.vehicles):
         veh = world.vehicles[agent_id]
         for leg in sorted(veh.legs, key=lambda l: l.leg_index):
-            departed = leg.complete or leg.departure_actual is not None
-            actual_dep = leg.departure_actual if departed \
-                else float(leg.scheduled_departure)
-            day = int(actual_dep // 1440)
-            dest_charger = 1 if (engine.by_node.get(leg.dest_node)
-                                 or engine._home_available(veh, leg)) \
-                else 0
-            enroute_id = leg.decision_charger_id \
-                if leg.decision == "enroute" else ""
-            if leg.stranded:
-                outcome = "stranded"
-            elif leg.charge_outcome == "queued-out":
-                outcome = "queued-out"
-            elif leg.charge_outcome == "charged-partial":
-                outcome = "charged-partial"
-            elif leg.charge_outcome == "charged-destination":
-                outcome = "charged-destination"
-            elif leg.charge_outcome == "at-target":
-                outcome = "at-target"
-            else:
-                outcome = "completed"
-            if has_trigger:
-                lines.append(
-                    "%d,%d,%d,%.3f,%.3f,%.3f,%d,%s,%s,%.3f,%s,%s,%s\n"
-                    % (veh.agent_id, leg.leg_index, day,
-                       float(leg.soc_start_kwh),
-                       float(leg.decision_leg_energy_kwh),
-                       float(leg.decision_remaining_kwh), dest_charger,
-                       leg.decision, enroute_id,
-                       float(leg.decision_target_soc), outcome,
-                       leg.trigger, leg.trigger_charger_id))
-            else:
-                lines.append(
-                    "%d,%d,%d,%.3f,%.3f,%.3f,%d,%s,%s,%.3f,%s\n"
-                    % (veh.agent_id, leg.leg_index, day,
-                       float(leg.soc_start_kwh),
-                       float(leg.decision_leg_energy_kwh),
-                       float(leg.decision_remaining_kwh), dest_charger,
-                       leg.decision, enroute_id,
-                       float(leg.decision_target_soc), outcome))
+            lines.append(_format_decision_row(world, veh, leg,
+                                              has_trigger, engine))
     with open(os.path.join(output_dir, "output_decisions.csv"),
               "w", newline="", encoding="utf-8") as fh:
         fh.writelines(lines)

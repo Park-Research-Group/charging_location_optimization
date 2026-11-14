@@ -7,9 +7,10 @@ import math
 
 import numpy as np
 
-from .charging import KM_PER_MILE
+from .charging import KM_PER_MILE, _format_decision_row
 from .cpp import ProgramStop, f32, floating_less, less_eq
 from .network import VehicleLink
+from .outputs import _format_agent_leg_row, _format_agent_vehicle_row
 from .sp import SPNetwork, find_best_path
 from .sp_mp import resolve_keys_parallel
 
@@ -17,10 +18,22 @@ SIM_INTERVAL = 0.1  # g_DTASimulationInterval (double)
 
 
 class Simulator:
-    def __init__(self, world):
+    def __init__(self, world, sink=None, progress=None, bar=None):
         self.world = world
+        # Incremental-output sink (v8): an IncrementalWriter, or
+        # None for exact v7 behaviour. progress is a RunProgress
+        # (or None); it carries the assignment key counts and the
+        # progress file. bar is a ProgressBar (or None); it is
+        # display only, ticked from the loading loop below and
+        # from the assignment key callback.
+        self.sink = sink
+        self.progress = progress
+        self.bar = bar
         self.generated = 0
         self.completed = 0
+        # Time of the most recent step, for the progress file
+        # (and team 2's bar); None before loading starts.
+        self.current_time = None
         # g_PrevailingTimeNetwork_MP[0], built in g_ReadInputFiles with
         # current (prevailing) information at the loading start time
         self.prevailing_net = SPNetwork(world, use_prevailing=True,
@@ -80,11 +93,30 @@ class Simulator:
         total = self.sp_cache_hits + self.sp_cache_misses
         self.world.sp_cache_hits = self.sp_cache_hits
         self.world.sp_cache_misses = self.sp_cache_misses
+        # The cache stats print after assignment, when the bar may
+        # already have drawn on a TTY: end its line first so the
+        # stats start on a fresh line (a no-op off a TTY, or when
+        # the bar never drew).
+        if self.bar is not None:
+            self.bar.ensure_newline()
         if total > 0:
             print("iteration-0 shortest paths: %d computed, %d reused "
                   "from cache (%.0f%% hit rate)"
                   % (self.sp_cache_misses, self.sp_cache_hits,
                      100.0 * self.sp_cache_hits / total))
+
+    def _note_key_resolved(self):
+        # One assignment key resolved (pool, serial fallback, or
+        # tripwire path): count it for the progress file and tick
+        # the console bar, which throttles its own display. The
+        # counts live on RunProgress; the bar only reads them.
+        if self.progress is not None:
+            self.progress.note_key_resolved()
+        if self.bar is not None and self.progress is not None:
+            self.bar.tick_assigning(
+                self.progress.assign_keys_resolved,
+                self.progress.assign_keys_total,
+                self.progress.started_mono)
 
     def assign_paths_iteration_zero(self, workers=None):
         # g_AgentBasedDynamicTrafficAssignmentSimulation, iteration 0:
@@ -198,17 +230,30 @@ class Simulator:
             self.sp_cache_hits = len(calls) - len(order)
             tasks = [(key, first_seen[key][0], first_seen[key][1],
                       first_seen[key][2]) for key in order]
+            if self.progress is not None:
+                self.progress.assign_keys_total = len(tasks)
+            on_key = self._note_key_resolved \
+                if self.progress is not None or self.bar is not None \
+                else None
             resolved = resolve_keys_parallel(world, net, tasks,
-                                             workers)
+                                             workers, on_key=on_key)
             if resolved is None:
                 # Serial fallback (pool not wanted, or any pool
                 # failure): the same keys at the same departures.
+                # Reset the resolved count first: a pool that
+                # failed mid-stream may already have reported
+                # some keys through on_key, and the fallback
+                # re-resolves every key.
+                if self.progress is not None:
+                    self.progress.assign_keys_resolved = 0
                 resolved = {}
                 for key, dep, dt, vot in tasks:
                     node_size, path_links, _ = find_best_path(
                         world, net, key[0], key[1], dep,
                         key[2], key[3], dt, vot)
                     resolved[key] = (node_size, tuple(path_links))
+                    if on_key is not None:
+                        on_key()
             per_call = [resolved[key]
                         for key, _d, _t, _v, _tg in calls]
         else:
@@ -217,10 +262,13 @@ class Simulator:
             # no pool, one search per call in walk order, exactly
             # as before. (No cache report: hits and misses stay 0,
             # as before.)
+            if self.progress is not None:
+                self.progress.assign_keys_total = len(calls)
             for key, dep, dt, vot, _t in calls:
                 per_call.append(self._sp_path(
                     world, net, cache, use_cache,
                     key[0], key[1], dep, key[2], key[3], dt, vot))
+                self._note_key_resolved()
         # Phase 3 -- assign the resolved paths in the main process,
         # in first-seen key order; distance is accumulated in path
         # order exactly as before.
@@ -640,6 +688,11 @@ class Simulator:
             elif veh.node_size >= 2:
                 self.n_generatable += 1
         self._early_exit_vetoed = False
+        if self.bar is not None:
+            # The loading phase change is announced here, not in
+            # run.py: the leg total is known only now, so the
+            # first bar line can already show legs 0/total.
+            self.bar.set_phase("loading", total=self.n_generatable)
         # Main loop: stops early once the network is drained (see the
         # break below). horizon = loading end + 300.
         step = 0
@@ -649,6 +702,14 @@ class Simulator:
             self.step(time, step)
             step_no = step
             step += 1
+            if self.bar is not None:
+                # Per-step loading tick (design section 9.4): the
+                # bar throttles itself, so this is one cheap check
+                # per step and an emission at most twice a minute.
+                self.bar.tick_loading(
+                    time, self.completed, self.n_generatable,
+                    self.progress.started_mono
+                    if self.progress is not None else None)
             # Early exit. Every clause is an O(1) integer/float compare.
             # time > world.end: every registered departure lies in
             # [start, end] (read time rejects anything outside), and each
@@ -937,6 +998,19 @@ class Simulator:
         leg.trigger = "plan_ahead"
         leg.trigger_charger_id = site.charger_id
 
+    def _emit_completed_vehicle(self, veh, current_time):
+        # Legacy completion: the agent row is final now (arrival,
+        # trip time and path are set; _post_loading's trip_fftt
+        # recompute is not a column in the row), so render it and
+        # hand it to the sink. Called from the two legacy
+        # completion sites; tour vehicles never reach here.
+        sink = self.sink
+        if sink is None:
+            return
+        sink.emit_agent_row(_format_agent_vehicle_row(self.world, veh))
+        sink.note_vehicle_completed()
+        sink.maybe_flush(current_time, self.completed)
+
     def _complete_leg(self, veh, current_time, step_no):
         # Destination reached: snapshot the leg, count the leg
         # completion, and schedule the next leg (or finish the
@@ -989,6 +1063,22 @@ class Simulator:
             if not veh.complete and veh.legs and \
                     veh.current_leg < len(veh.legs):
                 veh.legs[veh.current_leg].soc_start_kwh = veh.soc_kwh
+        # Incremental output (v8): the leg's rows are final now --
+        # finish_leg snapshotted it, the engine block ran, and the
+        # next leg's SoC sync wrote the next leg, not this one --
+        # so render both rows and hand them to the sink. Formatting
+        # here (not at flush time) is what makes the rows immune
+        # to any later mutation of the leg.
+        sink = self.sink
+        if sink is not None:
+            sink.emit_agent_row(
+                _format_agent_leg_row(self.world, veh, leg))
+            if getattr(self.world, "charging_engine", None) is not None:
+                sink.emit_decision_row(
+                    _format_decision_row(self.world, veh, leg, True))
+            if veh.complete:
+                sink.note_vehicle_completed()
+            sink.maybe_flush(current_time, self.completed)
 
     # ----- one simulation step -----
 
@@ -1042,6 +1132,7 @@ class Simulator:
                         self._complete_leg(veh, resume_time, step_no)
                     else:
                         self.completed += 1
+                        self._emit_completed_vehicle(veh, current_time)
                     continue
                 next_link = links[veh.link_ary[next_index].link_no]
                 next_node_number = -1
@@ -1111,6 +1202,25 @@ class Simulator:
                     self.completed += 1
                     self._schedule_next_leg(veh, leg, current_time,
                                             simulation_time_no)
+                    # Incremental output (v8): the instant leg
+                    # completes atomically here and _complete_leg
+                    # is never called for it, so its rows are
+                    # emitted here instead. It gets no decision
+                    # and no dwell charge in v7 either; its
+                    # decision fields keep their defaults, which
+                    # is what the formatter renders.
+                    sink = self.sink
+                    if sink is not None:
+                        sink.emit_agent_row(
+                            _format_agent_leg_row(world, veh, leg))
+                        if getattr(world, "charging_engine",
+                                   None) is not None:
+                            sink.emit_decision_row(
+                                _format_decision_row(world, veh, leg,
+                                                     True))
+                        if veh.complete:
+                            sink.note_vehicle_completed()
+                        sink.maybe_flush(current_time, self.completed)
                     continue
                 if leg.node_size < 2:
                     # No feasible path between distinct nodes:
@@ -1161,8 +1271,16 @@ class Simulator:
                             continue
                     # After the stay resolution (stay or not), the
                     # leg's starting charge is the vehicle's charge
-                    # before it enters the network.
-                    leg.soc_start_kwh = veh.soc_kwh
+                    # before it enters the network. Non-EVs carry
+                    # no charge (veh.soc_kwh is None), so they keep
+                    # 0.0 -- the value begin_leg set -- rather than
+                    # None, which the writer cannot render for a leg
+                    # that never completes: a completed non-EV leg
+                    # is reset to 0.0 in _complete_leg, but a
+                    # never-completed one kept the None and crashed
+                    # v7's end-of-run writer.
+                    leg.soc_start_kwh = veh.soc_kwh \
+                        if veh.soc_kwh is not None else 0.0
                     if decision == "enroute":
                         if site is None or leg.enroute_via is None:
                             raise ProgramStop(
@@ -1341,6 +1459,14 @@ class Simulator:
         for link in freeway_links:
             link.ring_arrival[slot] = f32(link.cflow_arrival)
             link.ring_departure[slot] = f32(link.cflow_departure)
+
+        # Incremental-output cadence, sim-time leg: a quiet
+        # stretch still ages the progress file, so check even on
+        # steps where nothing completed. O(1): one float compare,
+        # no wall-clock read here.
+        self.current_time = current_time
+        if self.sink is not None:
+            self.sink.maybe_flush(current_time, self.completed)
 
     def _node_transfer(self, current_time, step_no):
         world = self.world
@@ -1613,4 +1739,5 @@ class Simulator:
                     self._complete_leg(veh, current_time, step_no)
                 else:
                     self.completed += 1
+                    self._emit_completed_vehicle(veh, current_time)
             vehicle_out_count -= 1
