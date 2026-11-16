@@ -765,12 +765,26 @@ class ChargingEngine:
         dist, pred = _distance_tree(world, stranded_node_id)
         ff_net = self._ff_net()
         best = None
-        best_key = None
         best_from = None
-        for idx, site in enumerate(self.sites):
-            d = dist[site.node_id]
-            if d == float("inf"):
-                continue
+        # Rank all sites by the tow selection key (distance, then
+        # higher power, then file order) using ONLY the
+        # distance-tree distances -- no shortest-path call here.
+        # v8 ran find_best_path for EVERY site with a finite
+        # distance and kept only the winner's path (~200
+        # full-network searches per tow on the Swedish network);
+        # the winner is simply the first site in this rank order
+        # whose site->dest path exists, so search sites in rank
+        # order and stop at the first viable one. A site at the
+        # destination node needs no path search, exactly as
+        # before, and a site whose path search fails is skipped
+        # for the next-ranked site, exactly as before.
+        ranked = sorted(
+            (idx for idx, site in enumerate(self.sites)
+             if dist[site.node_id] != float("inf")),
+            key=lambda idx: (dist[self.sites[idx].node_id],
+                             -self.sites[idx].power_kw, idx))
+        for idx in ranked:
+            site = self.sites[idx]
             if site.node_id == leg.dest_node:
                 # Charger at the destination: the site->dest leg
                 # is trivially satisfied (no drive after charging),
@@ -785,11 +799,9 @@ class ChargingEngine:
                     veh.demand_type, veh.vot)
                 if node_size < 2:
                     continue
-            key = (d, -site.power_kw, idx)
-            if best_key is None or key < best_key:
-                best = site
-                best_key = key
-                best_from = path_from
+            best = site
+            best_from = path_from
+            break
         if best is None:
             return None
         site = best
