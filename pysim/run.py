@@ -18,14 +18,17 @@ from .progress import ProgressBar, RunProgress
 
 def run_loading(input_dir, output_dir, reroute_callback=None,
                 charging=None, workers=None, incremental=True,
-                progress=True, flush_legs=None, flush_sim_minutes=None):
+                progress=True, flush_legs=None, flush_sim_minutes=None,
+                vectorize=True):
     # incremental=True (default) writes outputs as legs complete
     # (v8); False restores exact v7 behaviour (all end-of-run
     # writers). progress is the console-bar switch: the progress
     # FILE (run_progress.json) is written either way -- it is the
     # durable signal and the bar is only the console convenience
     # (design section 6). The bar is display only; turning it off
-    # changes no output file.
+    # changes no output file. vectorize (v10) selects the numpy
+    # stage-3/5 path in the Simulator; False runs the old Python
+    # loops (--no-vectorize).
     world = World(input_dir)
     world.reroute_callback = reroute_callback
     if world.flow_model != 2:
@@ -83,7 +86,7 @@ def run_loading(input_dir, output_dir, reroute_callback=None,
                 flush_sim_minutes=flush_sim_minutes,
                 progress=prog).open()
             sim = Simulator(world, sink=writer, progress=prog,
-                            bar=bar)
+                            bar=bar, vectorize=vectorize)
             prog.state_fn = lambda: _progress_state(
                 world, sim, writer, prog, output_dir, final_rows)
             prog.write_now()
@@ -122,7 +125,8 @@ def run_loading(input_dir, output_dir, reroute_callback=None,
             # file still gets its phase writes; its rows_written
             # is filled in from the final counts below.
             prog = RunProgress(output_dir)
-            sim = Simulator(world, progress=prog, bar=bar)
+            sim = Simulator(world, progress=prog, bar=bar,
+                            vectorize=vectorize)
             prog.state_fn = lambda: _progress_state(
                 world, sim, writer, prog, output_dir, final_rows)
             prog.write_now()
@@ -261,7 +265,10 @@ def main(argv):
     # is still written), --no-incremental (exact v7 end-of-run
     # behaviour), --flush-legs N / --flush-minutes M (flush
     # cadence tuning; defaults 10000 legs / 60 sim-minutes).
+    # v10 flag: --no-vectorize runs the old Python stage-3/5
+    # loops instead of the numpy path (default is vectorized).
     workers = None
+    vectorize = True
     incremental = True
     progress = True
     flush_legs = None
@@ -289,6 +296,9 @@ def main(argv):
             i += 1
         elif arg == "--no-incremental":
             incremental = False
+            i += 1
+        elif arg == "--no-vectorize":
+            vectorize = False
             i += 1
         elif arg == "--flush-legs" and i + 1 < len(argv):
             try:
@@ -324,12 +334,14 @@ def main(argv):
     if len(args) < 2:
         print("usage: python -m pysim.run <input_dir> <output_dir> "
               "[--workers N] [--no-progress] [--no-incremental] "
-              "[--flush-legs N] [--flush-minutes M]")
+              "[--flush-legs N] [--flush-minutes M] "
+              "[--no-vectorize]")
         return 2
     run_loading(args[0], args[1], workers=workers,
                 incremental=incremental, progress=progress,
                 flush_legs=flush_legs,
-                flush_sim_minutes=flush_sim_minutes)
+                flush_sim_minutes=flush_sim_minutes,
+                vectorize=vectorize)
     return 0
 
 

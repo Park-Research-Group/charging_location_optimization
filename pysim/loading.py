@@ -18,7 +18,8 @@ SIM_INTERVAL = 0.1  # g_DTASimulationInterval (double)
 
 
 class Simulator:
-    def __init__(self, world, sink=None, progress=None, bar=None):
+    def __init__(self, world, sink=None, progress=None, bar=None,
+                 vectorize=True):
         self.world = world
         # Incremental-output sink (v8): an IncrementalWriter, or
         # None for exact v7 behaviour. progress is a RunProgress
@@ -31,6 +32,15 @@ class Simulator:
         self.bar = bar
         self.generated = 0
         self.completed = 0
+        # v10: vectorize the stage-3 / stage-5 per-link loops with
+        # numpy (see _stage3_vectorized). False runs the old
+        # Python loops verbatim (--no-vectorize). Default True.
+        self.vectorize = vectorize
+        # v10 stage-3/5 numpy mirror, built lazily on the first
+        # vectorized step and rebuilt whenever setup_loading has
+        # recreated the link state (see _s3_ensure). None until
+        # then; untouched on the --no-vectorize path.
+        self._s3 = None
         # Time of the most recent step, for the progress file
         # (and team 2's bar); None before loading starts.
         self.current_time = None
@@ -733,6 +743,7 @@ class Simulator:
                 if self._queues_empty():
                     break
                 self._early_exit_vetoed = True
+        self._s3_sync_links()
         self._post_loading()
 
     def _queues_empty(self):
@@ -1360,6 +1371,164 @@ class Simulator:
                 else:
                     break
 
+        # stage 3: link in/out capacities (Newell only). The old
+        # Python loop lives in _stage3_python; the default
+        # vectorized path is _stage3_vectorized (v10).
+        relax = current_time >= world.end + 60
+        if self.vectorize:
+            self._stage3_vectorized(links, step_no, relax)
+        else:
+            self._stage3_python(links, step_no, relax)
+        # merge distribution of the downstream in-capacity
+        for link in links:
+            if link.merge_flag < 1:
+                continue
+            total_demand = sum(
+                len(links[entry[0]].exit_queue)
+                for entry in link.merge_incoming)
+            if total_demand <= link.link_in_capacity:
+                continue
+            if len(link.merge_incoming) == 2:
+                for il, entry in enumerate(link.merge_incoming):
+                    other = link.merge_incoming[1 - il][0]
+                    entry[2] = f32(link.link_in_capacity -
+                                   len(links[other].exit_queue))
+            for entry in link.merge_incoming:
+                incoming = links[entry[0]]
+                cap1 = f32(f32(link.link_in_capacity) * entry[1])
+                cap2 = entry[2]
+                cap3 = f32(incoming.link_out_capacity)
+                merged = min(cap3, max(cap1, cap2))
+                prev = incoming.cum_merge_counter
+                incoming.cum_merge_counter = f32(
+                    incoming.cum_merge_counter + merged)
+                incoming.link_out_capacity = \
+                    int(incoming.cum_merge_counter) - int(prev)
+
+        # stage 4: node transfer
+        self._node_transfer(current_time, step_no)
+
+        # stage 5: ring buffers for Newell's backward wave. Only
+        # freeway links are read (stage-3 freeway branch), so only
+        # they need their ring written; the Swedish network writes
+        # every link as freeway type, so this saves ~0 there.
+        if self.vectorize:
+            self._stage5_vectorized(links, step_no)
+        else:
+            self._stage5_python(links, step_no)
+
+        # Incremental-output cadence, sim-time leg: a quiet
+        # stretch still ages the progress file, so check even on
+        # steps where nothing completed. O(1): one float compare,
+        # no wall-clock read here.
+        self.current_time = current_time
+        if self.sink is not None:
+            self.sink.maybe_flush(current_time, self.completed)
+
+    # ----- v10: vectorized stage 3 / stage 5 -----
+
+    def _s3_ensure(self, links):
+        # Build (or rebuild) the numpy mirror for the vectorized
+        # stage-3/5 path. Per-link constants come straight from
+        # link.s3_consts and link.space_capacity as float64, so
+        # every double in the vectorized path holds exactly the
+        # value the Python loop computed with; the running
+        # counters (cum_out/cum_in and their prevs) are float32 /
+        # int64 mirrors of the link attributes. The ring buffers
+        # are one (n_links, 301) float32 array each, and each
+        # link's ring_arrival / ring_departure is re-pointed at
+        # its row of that array: a row supports the same [slot]
+        # reads and writes the old lists did, so the Python path
+        # keeps working unchanged on rows, and the vectorized
+        # path reads/writes whole columns. Rebuild triggers:
+        # first use, a different link list, or setup_loading
+        # having recreated the ring lists (the token is the
+        # list-or-row object link 0 currently carries). A
+        # rebuild copies the links' current values, so a
+        # Simulator that steps after another Simulator re-linked
+        # the rows still sees the true state.
+        cache = self._s3
+        if cache is not None and cache["links"] is links:
+            if not links:
+                return cache
+            if cache["ring_token"] is links[0].ring_arrival:
+                return cache
+        n = len(links)
+        consts = [link.s3_consts for link in links]
+        ring_arr = np.zeros((n, 301), dtype=np.float32)
+        ring_dep = np.zeros((n, 301), dtype=np.float32)
+        for i, link in enumerate(links):
+            ring_arr[i] = link.ring_arrival
+            ring_dep[i] = link.ring_departure
+            link.ring_arrival = ring_arr[i]
+            link.ring_departure = ring_dep[i]
+        is_ramp = np.array(
+            ["r" in link.type_code for link in links], dtype=bool)
+        on_ramp = np.array(
+            [bool(link.on_ramp) for link in links], dtype=bool)
+        cache = {
+            "links": links,
+            "ring_token": links[0].ring_arrival if links else None,
+            "cap": np.array([c[0] for c in consts], dtype=np.float64),
+            "cap_relax": np.array([c[1] for c in consts],
+                                  dtype=np.float64),
+            "inflow_cap": np.array([c[2] for c in consts],
+                                   dtype=np.float64),
+            "jam": np.array([c[3] for c in consts], dtype=np.float64),
+            "inflow_rate": np.array([c[4] for c in consts],
+                                    dtype=np.float64),
+            "space_cap": np.array(
+                [float(link.space_capacity) for link in links],
+                dtype=np.float64),
+            "bw_steps": np.array(
+                [link.backward_wave_steps for link in links],
+                dtype=np.int64),
+            "is_fw": np.array(
+                ["f" in link.type_code for link in links],
+                dtype=bool),
+            "fw_idx": None,
+            "ramp_on_idx": np.flatnonzero(is_ramp & on_ramp),
+            "ramp_off_idx": np.flatnonzero(is_ramp & ~on_ramp),
+            "cum_out": np.array(
+                [link.cum_out_counter for link in links],
+                dtype=np.float32),
+            "cum_in": np.array(
+                [link.cum_in_counter for link in links],
+                dtype=np.float32),
+            "cum_out_prev": np.array(
+                [link.cum_out_prev for link in links], dtype=np.int64),
+            "cum_in_prev": np.array(
+                [link.cum_in_prev for link in links], dtype=np.int64),
+            "ring_arr": ring_arr,
+            "ring_dep": ring_dep,
+        }
+        cache["fw_idx"] = np.flatnonzero(cache["is_fw"])
+        self._s3 = cache
+        return cache
+
+    def _s3_sync_links(self):
+        # Copy the vectorized stage-3 mirror counters back onto
+        # the link objects, so post-run link state reads exactly
+        # as it would after the Python path. Runs once, at the
+        # end of network_loading; a no-op when the vectorized
+        # path never ran. The ring buffers need no sync: the
+        # links' ring lists ARE the mirror rows (see _s3_ensure).
+        s3 = self._s3
+        if s3 is None:
+            return
+        for link, co, ci, cpo, cpi in zip(
+                s3["links"], s3["cum_out"], s3["cum_in"],
+                s3["cum_out_prev"], s3["cum_in_prev"]):
+            link.cum_out_counter = co
+            link.cum_in_counter = ci
+            link.cum_out_prev = int(cpo)
+            link.cum_in_prev = int(cpi)
+
+    def _stage3_python(self, links, step_no, relax):
+        # The v9 stage-3 loop, verbatim (moved out of step so
+        # the vectorized path can dispatch to it). Runs when
+        # vectorize is False (--no-vectorize).
+        world = self.world
         # stage 3: link in/out capacities (Newell only). Plain-float
         # arithmetic on the per-link constants precomputed in
         # link.setup_loading (link.s3_consts); f32() is re-applied
@@ -1370,7 +1539,6 @@ class Simulator:
         # one f32() rounding equals the one float32 add it replaces;
         # f32(min(x, y)) with x float32 is likewise exact by the
         # monotonicity of rounding. Accumulation order is unchanged.
-        relax = current_time >= world.end + 60
         for link in links:
             cap, cap_relax, inflow_cap, jam, inflow_rate = \
                 link.s3_consts
@@ -1418,39 +1586,111 @@ class Simulator:
                     link.link_in_capacity = 99999
                 if not link.on_ramp and world.use_pq_off_ramps == 1:
                     link.link_in_capacity = 99999
-        # merge distribution of the downstream in-capacity
-        for link in links:
-            if link.merge_flag < 1:
-                continue
-            total_demand = sum(
-                len(links[entry[0]].exit_queue)
-                for entry in link.merge_incoming)
-            if total_demand <= link.link_in_capacity:
-                continue
-            if len(link.merge_incoming) == 2:
-                for il, entry in enumerate(link.merge_incoming):
-                    other = link.merge_incoming[1 - il][0]
-                    entry[2] = f32(link.link_in_capacity -
-                                   len(links[other].exit_queue))
-            for entry in link.merge_incoming:
-                incoming = links[entry[0]]
-                cap1 = f32(f32(link.link_in_capacity) * entry[1])
-                cap2 = entry[2]
-                cap3 = f32(incoming.link_out_capacity)
-                merged = min(cap3, max(cap1, cap2))
-                prev = incoming.cum_merge_counter
-                incoming.cum_merge_counter = f32(
-                    incoming.cum_merge_counter + merged)
-                incoming.link_out_capacity = \
-                    int(incoming.cum_merge_counter) - int(prev)
 
-        # stage 4: node transfer
-        self._node_transfer(current_time, step_no)
+    def _stage3_vectorized(self, links, step_no, relax):
+        # Vectorized stage 3: the same arithmetic as
+        # _stage3_python, over whole-link arrays at once.
+        # Rounding is preserved exactly: every f32() in the
+        # Python loop becomes one float32 rounding of a float64
+        # sum whose addends are float32-valued (exact in
+        # float64), and every int() becomes one truncating
+        # int64 cast of a non-negative float32. Masks replace
+        # the per-link branches (freeway / ramp / relax /
+        # backward-wave). The two capacities are written back
+        # to the link objects every step: the merge
+        # distribution and _discharge_link read them from
+        # there. The cum counters live in the mirror (only
+        # stage 3 reads them) and are synced back to the links
+        # by _s3_sync_links at the end of network_loading.
+        s3 = self._s3_ensure(links)
+        n = len(links)
+        if n == 0:
+            return
+        # cflow is owned by stages 1 and 4, so gather it fresh.
+        cflow_arr = np.array(
+            [link.cflow_arrival for link in links], dtype=np.int64)
+        cflow_dep = np.array(
+            [link.cflow_departure for link in links], dtype=np.int64)
+        # Out-capacity: cum_out += capacity (one float32
+        # rounding), link_out = int(cum_out) - cum_out_prev.
+        cap_use = s3["cap_relax"] if relax else s3["cap"]
+        cum_out = (s3["cum_out"].astype(np.float64) +
+                   cap_use).astype(np.float32)
+        s3["cum_out"] = cum_out
+        link_out = cum_out.astype(np.int64) - s3["cum_out_prev"]
+        s3["cum_out_prev"] += link_out
+        # Inflow target: 99999 for non-freeway links; freeway
+        # links take min(space left, inflow cap), floored at 0.
+        on_link = cflow_arr - cflow_dep
+        f_in = np.full(n, 99999.0, dtype=np.float64)
+        fw = s3["is_fw"]
+        f_in[fw] = np.minimum(
+            s3["space_cap"][fw] - on_link[fw], s3["inflow_cap"][fw])
+        f_in[fw] = np.maximum(f_in[fw], 0.0)
+        # Backward wave: only freeway links whose wave has had
+        # time to travel the link. slot varies per link (the
+        # wave steps depend on link length), so the ring reads
+        # are fancy-indexed (row, per-link slot) pairs.
+        bw = fw & (step_no >= s3["bw_steps"])
+        if bw.any():
+            rows = np.flatnonzero(bw)
+            slot = np.maximum(0, step_no - s3["bw_steps"][rows]) % 300
+            n_allow = (s3["ring_dep"][rows, slot].astype(np.float64) +
+                       s3["jam"][rows]).astype(np.float32).astype(np.int64)
+            prev_slot = max(0, step_no - 1) % 300
+            flow_allowed = (n_allow -
+                            s3["ring_arr"][rows, prev_slot].astype(np.int64))
+            flow_allowed = np.maximum(flow_allowed, 0)
+            f_in[rows] = np.minimum(
+                f_in[rows], flow_allowed.astype(np.float64))
+        # Minimum-inflow floor: cap under relax, else the
+        # precomputed inflow rate.
+        rate = s3["cap"] if relax else s3["inflow_rate"]
+        f_in[fw] = np.maximum(f_in[fw], rate[fw])
+        # In-capacity: cum_in += f32(f_in) (one float32 rounding
+        # of f_in, then the exact float64 add, then one rounding).
+        cum_in = (s3["cum_in"].astype(np.float64) +
+                  f_in.astype(np.float32).astype(np.float64)).astype(
+                      np.float32)
+        s3["cum_in"] = cum_in
+        link_in = cum_in.astype(np.int64) - s3["cum_in_prev"]
+        s3["cum_in_prev"] += link_in
+        # Ramp point queues: a ramp link's in-capacity is
+        # unlimited when its queue flag is on.
+        if self.world.use_pq_on_ramps == 1:
+            link_in[s3["ramp_on_idx"]] = 99999
+        if self.world.use_pq_off_ramps == 1:
+            link_in[s3["ramp_off_idx"]] = 99999
+        for link, lo, li in zip(links, link_out, link_in):
+            link.link_out_capacity = int(lo)
+            link.link_in_capacity = int(li)
 
-        # stage 5: ring buffers for Newell's backward wave. Only
-        # freeway links are read (stage-3 freeway branch), so only
-        # they need their ring written; the Swedish network writes
-        # every link as freeway type, so this saves ~0 there.
+    def _stage5_vectorized(self, links, step_no):
+        # Vectorized stage 5: the two ring writes for freeway
+        # links, as one column write each. cflow is gathered
+        # fresh: stage 4 has moved vehicles since stage 3.
+        # The writes land in the shared ring arrays, so they
+        # are visible through link.ring_arrival /
+        # link.ring_departure exactly as the Python loop's
+        # writes were.
+        s3 = self._s3_ensure(links)
+        fw_idx = s3["fw_idx"]
+        if len(fw_idx) == 0:
+            return
+        slot = step_no % 300
+        cflow_arr = np.array(
+            [link.cflow_arrival for link in links], dtype=np.int64)
+        cflow_dep = np.array(
+            [link.cflow_departure for link in links], dtype=np.int64)
+        s3["ring_arr"][fw_idx, slot] = \
+            cflow_arr[fw_idx].astype(np.float32)
+        s3["ring_dep"][fw_idx, slot] = \
+            cflow_dep[fw_idx].astype(np.float32)
+
+    def _stage5_python(self, links, step_no):
+        # The v9 stage-5 loop, verbatim (moved out of step so
+        # the vectorized path can dispatch to it). Runs when
+        # vectorize is False (--no-vectorize).
         slot = step_no % 300
         freeway_links = self.freeway_links
         if freeway_links is None:
@@ -1459,14 +1699,6 @@ class Simulator:
         for link in freeway_links:
             link.ring_arrival[slot] = f32(link.cflow_arrival)
             link.ring_departure[slot] = f32(link.cflow_departure)
-
-        # Incremental-output cadence, sim-time leg: a quiet
-        # stretch still ages the progress file, so check even on
-        # steps where nothing completed. O(1): one float compare,
-        # no wall-clock read here.
-        self.current_time = current_time
-        if self.sink is not None:
-            self.sink.maybe_flush(current_time, self.completed)
 
     def _node_transfer(self, current_time, step_no):
         world = self.world

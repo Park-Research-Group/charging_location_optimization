@@ -17,7 +17,8 @@ from .run import run_loading
 
 def run_pysim(input_dir, output_dir, verbose=False, reroute_callback=None,
               charging=None, workers=None, incremental=True,
-              progress=True, flush_legs=None, flush_sim_minutes=None):
+              progress=True, flush_legs=None, flush_sim_minutes=None,
+              vectorize=True):
     """Run one PySim loading pass.
 
     input_dir is a directory holding DTALite-format input files. It is
@@ -66,6 +67,8 @@ def run_pysim(input_dir, output_dir, verbose=False, reroute_callback=None,
     console-bar switch (the bar is display only); the progress
     file is written either way. flush_legs / flush_sim_minutes
     tune the flush cadence (defaults 10000 legs / 60 sim-minutes).
+    vectorize (default True, v10) runs the numpy stage-3/5 path;
+    False runs the old Python loops (--no-vectorize on the CLI).
 
     Returns a dict with the input/output dirs, the output paths, the
     agent counts, and the charging summary (or None). Raises ProgramStop
@@ -85,7 +88,8 @@ def run_pysim(input_dir, output_dir, verbose=False, reroute_callback=None,
                         charging=charging, workers=workers,
                         incremental=incremental, progress=progress,
                         flush_legs=flush_legs,
-                        flush_sim_minutes=flush_sim_minutes)
+                        flush_sim_minutes=flush_sim_minutes,
+                        vectorize=vectorize)
     agents = len(world.vehicles)
     completed = sum(1 for veh in world.vehicles.values() if veh.complete)
     outputs = {
