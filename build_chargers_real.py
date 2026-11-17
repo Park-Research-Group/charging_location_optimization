@@ -45,9 +45,11 @@ the end lists the snap-distance distribution, stations kept and
 dropped with reasons, charger rows by power level, the POI row
 count, and the flagged outliers.
 
-The two input files are optional: when omitted they are found in
-input_files (the .xlsx, preferring a name containing "charger" or
-"poi", and input_node.csv). Pass them explicitly to use other files.
+The two input files are optional: when omitted, the .xlsx is found
+in input_files (preferring a name containing "charger" or "poi")
+and input_node.csv is found in the dtalite input directory
+(--dtalite-dir, default dtalite_inputs). Pass them explicitly to
+use other files.
 
 Requires pyproj and scipy (pip install pyproj scipy); both are
 hard requirements, with a clear error when missing.
@@ -160,10 +162,13 @@ def main(argv):
                              "found in --input-files")
     parser.add_argument("nodes", nargs="?", default=None,
                         help="input_node.csv (SWEREF99TM); when "
-                             "omitted, found in --input-files")
+                             "omitted, found in --dtalite-dir")
     parser.add_argument("--input-files", default="input_files",
-                        help="folder to search when xlsx/nodes are "
+                        help="folder to search for the .xlsx when it is "
                              "omitted (default: input_files)")
+    parser.add_argument("--dtalite-dir", default="dtalite_inputs",
+                        help="folder to search for input_node.csv when "
+                             "nodes is omitted (default: dtalite_inputs)")
     parser.add_argument("--out-dir", default=".",
                         help="where to write the two csv files "
                              "(default: current directory)")
@@ -185,7 +190,7 @@ def main(argv):
         args.xlsx = find_xlsx(args.input_files)
         print("xlsx: %s" % args.xlsx)
     if args.nodes is None:
-        args.nodes = find_nodes(args.input_files)
+        args.nodes = find_nodes(args.dtalite_dir)
         print("nodes: %s" % args.nodes)
     nodes = read_nodes(args.nodes)
     node_ids = sorted(nodes)
