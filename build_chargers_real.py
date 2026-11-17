@@ -45,12 +45,17 @@ the end lists the snap-distance distribution, stations kept and
 dropped with reasons, charger rows by power level, the POI row
 count, and the flagged outliers.
 
+The two input files are optional: when omitted they are found in
+input_files (the .xlsx, preferring a name containing "charger" or
+"poi", and input_node.csv). Pass them explicitly to use other files.
+
 Requires pyproj and scipy (pip install pyproj scipy); both are
 hard requirements, with a clear error when missing.
 """
 
 import argparse
 import csv
+import glob
 import os
 import sys
 
@@ -123,13 +128,42 @@ def read_nodes(path):
     return nodes
 
 
+def find_xlsx(folder):
+    cands = sorted(glob.glob(os.path.join(folder, "*.xlsx")))
+    if not cands:
+        raise SystemExit("no .xlsx file in %s" % folder)
+    named = [c for c in cands
+             if "charger" in os.path.basename(c).lower()
+             or "poi" in os.path.basename(c).lower()]
+    if len(named) == 1:
+        return named[0]
+    if len(cands) == 1:
+        return cands[0]
+    raise SystemExit("several .xlsx files in %s, pass one "
+                     "explicitly: %s" % (folder, ", ".join(cands)))
+
+
+def find_nodes(folder):
+    path = os.path.join(folder, "input_node.csv")
+    if not os.path.isfile(path):
+        raise SystemExit("no input_node.csv in %s" % folder)
+    return path
+
+
 def main(argv):
     parser = argparse.ArgumentParser(
         description="Build input_charger.csv and "
                     "input_poi_charger.csv from the NOBIL/OSM "
                     "pair file and a Swedish node file.")
-    parser.add_argument("xlsx", help="pair file (.xlsx)")
-    parser.add_argument("nodes", help="input_node.csv (SWEREF99TM)")
+    parser.add_argument("xlsx", nargs="?", default=None,
+                        help="pair file (.xlsx); when omitted, "
+                             "found in --input-files")
+    parser.add_argument("nodes", nargs="?", default=None,
+                        help="input_node.csv (SWEREF99TM); when "
+                             "omitted, found in --input-files")
+    parser.add_argument("--input-files", default="input_files",
+                        help="folder to search when xlsx/nodes are "
+                             "omitted (default: input_files)")
     parser.add_argument("--out-dir", default=".",
                         help="where to write the two csv files "
                              "(default: current directory)")
@@ -147,6 +181,12 @@ def main(argv):
     if args.max_snap_km <= 0:
         parser.error("--max-snap-km must be positive")
 
+    if args.xlsx is None:
+        args.xlsx = find_xlsx(args.input_files)
+        print("xlsx: %s" % args.xlsx)
+    if args.nodes is None:
+        args.nodes = find_nodes(args.input_files)
+        print("nodes: %s" % args.nodes)
     nodes = read_nodes(args.nodes)
     node_ids = sorted(nodes)
     coords = [nodes[n] for n in node_ids]
