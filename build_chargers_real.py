@@ -49,7 +49,8 @@ The two input files are optional: when omitted, the .xlsx is found
 in input_files (preferring a name containing "charger" or "poi")
 and input_node.csv is found in the dtalite input directory
 (--dtalite-dir, default dtalite_inputs). Pass them explicitly to
-use other files.
+use other files. The two csv files are written to the dtalite
+input directory by default.
 
 Requires pyproj and scipy (pip install pyproj scipy); both are
 hard requirements, with a clear error when missing.
@@ -169,9 +170,9 @@ def main(argv):
     parser.add_argument("--dtalite-dir", default="dtalite_inputs",
                         help="folder to search for input_node.csv when "
                              "nodes is omitted (default: dtalite_inputs)")
-    parser.add_argument("--out-dir", default=".",
+    parser.add_argument("--out-dir", default=None,
                         help="where to write the two csv files "
-                             "(default: current directory)")
+                             "(default: the dtalite input directory)")
     parser.add_argument("--sheet", default="in",
                         help="xlsx sheet name (default: in)")
     parser.add_argument("--level2-kw", type=float, default=22.0,
@@ -185,6 +186,8 @@ def main(argv):
         parser.error("--level2-kw must be positive")
     if args.max_snap_km <= 0:
         parser.error("--max-snap-km must be positive")
+    if args.out_dir is None:
+        args.out_dir = args.dtalite_dir
 
     if args.xlsx is None:
         args.xlsx = find_xlsx(args.input_files)
