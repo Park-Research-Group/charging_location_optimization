@@ -297,6 +297,68 @@ def _trigger_sp_leg(world, ff_net, origin, dest, departure,
         float(total_cost), True
 
 
+def select_site_by_availability(sites, node_id, arrival_time):
+    # Open-plug selection (v11): among the sites at one node,
+    # pick the one whose earliest-free plug is ready soonest at
+    # arrival_time: ready = max(arrival_time, min(plug_free)).
+    # Smallest ready wins; ties break toward higher power, then
+    # lowest file index (sites is in file order, and only a
+    # strictly better power replaces at equal ready). A node with
+    # a single site returns that site unchanged, so single-row
+    # nodes behave exactly as v10. The map's per-node distance,
+    # time and path are unchanged by the choice: every site at
+    # the node shares them. A vehicle takes ANY open plug at a
+    # charging station, regardless of power (Eli's answer, Nov
+    # 2026): a deliberate simplification, to be replaced by
+    # power-aware / preference-weighted scoring later.
+    best = None
+    best_ready = None
+    best_power = -1.0
+    for site in sites:
+        if site.node_id != node_id:
+            continue
+        ready = max(arrival_time, min(site.plug_free))
+        if best is None or ready < best_ready - 1e-9 or \
+                (abs(ready - best_ready) <= 1e-9 and
+                 site.power_kw > best_power):
+            best = site
+            best_ready = ready
+            best_power = site.power_kw
+    return best
+
+
+def _poi_station_sites(world, dest_node, walk_tolerance_m):
+    # True-walk opportunist choice (v11): the engine's POI index
+    # (input_poi_charger.csv) maps a destination node to the
+    # stations with POIs snapped to it, each with its smallest
+    # true walk distance. Returns (sites, walk_m) for the
+    # smallest-walk station within tolerance, ("too-far", walk_m)
+    # when the smallest walk exceeds the tolerance, or None when
+    # the engine has no POI file or no POI rows snapped to the
+    # destination node (the caller then falls back to the map's
+    # road-network walk test, exactly as v10). The walk is
+    # station-level: the sites are the station's rows, and the
+    # plug choice among them (and any other rows at the node) is
+    # the open-plug selection at the call site.
+    engine = getattr(world, "charging_engine", None)
+    if engine is None:
+        return None
+    poi = getattr(engine, "poi_walk", None)
+    if not poi:
+        return None
+    entries = poi.get(dest_node)
+    if not entries:
+        return None
+    station_id, walk_m = min(entries.items(),
+                             key=lambda kv: (kv[1], kv[0]))
+    if walk_m > walk_tolerance_m:
+        return ("too-far", walk_m)
+    sites = engine.sites_for_station(station_id)
+    if not sites:
+        return None
+    return (sites, walk_m)
+
+
 def choose_charger_for_trigger(nearest_map, trigger, from_node, dest_node,
                                soc_kwh, consumption_kwh_per_km, battery_kwh,
                                target_soc_frac, walk_tolerance_m=None,
@@ -319,8 +381,16 @@ def choose_charger_for_trigger(nearest_map, trigger, from_node, dest_node,
     # (charger node IS the destination); the caller handles empty
     # lists. The map path and the fallback path apply the same
     # contract; they differ only in how the nearest charger is
-    # found. Extra context (world, ff_net, veh, departure) is
-    # optional: world / ff_net default to the map's when a map is
+    # found. v11: the map / loop fixes the charger NODE, and the
+    # plug at that node is then picked by live availability at
+    # the estimated arrival (select_site_by_availability); for
+    # the opportunistic trigger the walk test uses the TRUE walk
+    # distance from the POI file when the destination node has
+    # POI entries, else the map's road-network distance as
+    # before. Without a POI file, and on single-row nodes, the
+    # result is exactly v10's. Extra context (world, ff_net, veh,
+    # departure) is optional: world / ff_net default to the map's
+    # when a map is
     # given, and to the engine's free-flow net otherwise; veh
     # supplies demand_type / vot for the shortest-path calls
     # (defaults 1 / 10.0); departure is the leg departure used
@@ -355,19 +425,33 @@ def choose_charger_for_trigger(nearest_map, trigger, from_node, dest_node,
         idx = nearest_map.site_index[lookup]
         if idx < 0:
             return None
-        site = nearest_map.sites[idx]
+        map_site = nearest_map.sites[idx]
         if trigger == "opportunistic":
-            # Walk test on the map distance dest -> charger.
-            if nearest_map.dist_km[lookup] * 1000.0 \
-                    > walk_tolerance_m:
-                return None
+            # Walk test: the true walk distance from the POI file
+            # when the destination node has POI entries, else the
+            # map's road-network distance, as v10. The POI choice
+            # fixes the charger node; the plug choice at that node
+            # is the open-plug selection below.
+            poi = _poi_station_sites(world, dest_node,
+                                     walk_tolerance_m)
+            if poi is not None:
+                if poi[0] == "too-far":
+                    return None
+                node = poi[0][0].node_id
+            else:
+                if nearest_map.dist_km[lookup] * 1000.0 \
+                        > walk_tolerance_m:
+                    return None
+                node = map_site.node_id
             links_to, energy_to, time_to, ok = _trigger_sp_leg(
-                world, ff_net, from_node, site.node_id, departure,
+                world, ff_net, from_node, node, departure,
                 consumption, demand_type, vot)
             if not ok or energy_to > soc_kwh + 1e-9:
                 return None
+            site = select_site_by_availability(
+                nearest_map.sites, node, departure + time_to)
             links_from, energy_from, time_from, ok = _trigger_sp_leg(
-                world, ff_net, site.node_id, dest_node,
+                world, ff_net, node, dest_node,
                 int(departure + time_to), consumption,
                 demand_type, vot)
             if not ok or energy_from > \
@@ -381,8 +465,16 @@ def choose_charger_for_trigger(nearest_map, trigger, from_node, dest_node,
                 > soc_kwh + 1e-9:
             return None
         time_to = nearest_map.time_min[from_node]
+        # v11: which plug at the nearest node is decided by live
+        # availability at the estimated arrival (departure plus
+        # the map time to the node), not by the map's static
+        # highest-power site. The node, path and times are
+        # unchanged: every site at the node shares them.
+        site = select_site_by_availability(
+            nearest_map.sites, map_site.node_id,
+            departure + time_to)
         links_from, energy_from, time_from, ok = _trigger_sp_leg(
-            world, ff_net, site.node_id, dest_node,
+            world, ff_net, map_site.node_id, dest_node,
             int(departure + time_to), consumption,
             demand_type, vot)
         if not ok or energy_from > \
@@ -407,29 +499,57 @@ def choose_charger_for_trigger(nearest_map, trigger, from_node, dest_node,
         sites, _by_node = read_charger_sites(world)
     lookup = from_node if trigger in ("liquid", "plan_ahead") \
         else dest_node
+    # v11: an opportunistic trigger with POI data for the
+    # destination node uses the true walk distance (see
+    # _poi_station_sites); the per-site loop below is then
+    # skipped -- the station is fixed by the walk, and only its
+    # node still needs a lookup leg for the availability
+    # estimate. Without POI data the loop runs as before.
+    poi_node = None
+    if trigger == "opportunistic":
+        poi = _poi_station_sites(world, dest_node,
+                                 walk_tolerance_m)
+        if poi is not None:
+            if poi[0] == "too-far":
+                return None
+            poi_node = poi[0][0].node_id
     best_idx = None
     best_time = None
     best_power = -1.0
     lookup_links = None
-    for idx, site in enumerate(sites):
+    if poi_node is not None:
         _l, _e, t, ok = _trigger_sp_leg(
-            world, ff_net, lookup, site.node_id, departure,
+            world, ff_net, lookup, poi_node, departure,
             consumption, demand_type, vot)
         if not ok:
-            continue
-        if best_time is None or t < best_time - 1e-9 or \
-                (abs(t - best_time) <= 1e-9 and
-                 site.power_kw > best_power):
-            best_time = t
-            best_power = site.power_kw
-            best_idx = idx
-            lookup_links = _l
+            return None
+        best_time = t
+        lookup_links = _l
+        best_idx = next(
+            (i for i, s in enumerate(sites)
+             if s.node_id == poi_node), None)
+        if best_idx is None:
+            return None
+    else:
+        for idx, site in enumerate(sites):
+            _l, _e, t, ok = _trigger_sp_leg(
+                world, ff_net, lookup, site.node_id, departure,
+                consumption, demand_type, vot)
+            if not ok:
+                continue
+            if best_time is None or t < best_time - 1e-9 or \
+                    (abs(t - best_time) <= 1e-9 and
+                     site.power_kw > best_power):
+                best_time = t
+                best_power = site.power_kw
+                best_idx = idx
+                lookup_links = _l
     if best_idx is None:
         return None
     site = sites[best_idx]
     if trigger == "opportunistic":
-        if _links_dist_km(world, lookup_links) * 1000.0 \
-                > walk_tolerance_m:
+        if poi_node is None and _links_dist_km(world, lookup_links) \
+                * 1000.0 > walk_tolerance_m:
             return None
         links_to, energy_to, time_to, ok = _trigger_sp_leg(
             world, ff_net, from_node, site.node_id, departure,
@@ -442,6 +562,12 @@ def choose_charger_for_trigger(nearest_map, trigger, from_node, dest_node,
         time_to = best_time
         if energy_to > soc_kwh + 1e-9:
             return None
+    # v11: which plug at the chosen node is decided by live
+    # availability at the estimated arrival (departure plus the
+    # lookup-leg time), not by the loop's static highest-power
+    # pick. The node, paths and times are unchanged.
+    site = select_site_by_availability(
+        sites, site.node_id, departure + time_to)
     links_from, energy_from, time_from, ok = _trigger_sp_leg(
         world, ff_net, site.node_id, dest_node,
         int(departure + time_to), consumption,

@@ -20,7 +20,7 @@ import os
 
 from .cpp import CsvParser, ProgramStop
 from .decision import choose_charger_for_trigger, decide_charging, \
-    _links_energy, leg_free_flow_energy
+    _links_energy, leg_free_flow_energy, select_site_by_availability
 from .sp import SPNetwork, find_best_path, multi_run_valid
 
 KM_PER_MILE = 1.60934  # DTALite link lengths are in miles
@@ -90,6 +90,18 @@ def read_charger_sites(world):
         sites.append(site)
         by_node.setdefault(site.node_id, []).append(site)
     return sites, by_node
+
+
+def _station_id(charger_id):
+    # Base station id of a charger row: the converter
+    # (build_chargers_real.py) writes the bare station id for
+    # single-level stations and station_id + _L1/_L2/_L3 for
+    # multi-row stations; the POI file references the bare
+    # station id, so this strips the suffix to resolve it.
+    for suffix in ("_L1", "_L2", "_L3"):
+        if charger_id.endswith(suffix):
+            return charger_id[:-len(suffix)]
+    return charger_id
 
 
 def _ev_params(world, veh):
@@ -188,6 +200,18 @@ class ChargingEngine:
         self.config = cfg
         self.world = world
         self.sites, self.by_node = read_charger_sites(world)
+        # Station id -> its rows (a multi-level station has one
+        # row per power level); the POI file references the
+        # station, so the opportunist resolves through here.
+        self.sites_by_station = {}
+        for site in self.sites:
+            self.sites_by_station.setdefault(
+                _station_id(site.charger_id), []).append(site)
+        # True-walk POI index (v11): internal node id ->
+        # {station_id: smallest walk_dist_m}. Empty when no POI
+        # file is present, which leaves v10 behaviour untouched.
+        self.poi_walk = {}
+        self._load_poi_file()
         self.events = []       # tour-mode tuples (15 fields)
         self.home_events = []  # subset of events at HOME chargers
         self.stranded = []     # tour-mode tuples (13 fields)
@@ -232,9 +256,68 @@ class ChargingEngine:
         self.nearest_map = NearestChargerMap(
             self.world, ff_net, self.sites)
 
-    def _dest_site(self, leg):
+    def sites_for_station(self, station_id):
+        # The site rows of one station, in file order, or [].
+        return self.sites_by_station.get(station_id, [])
+
+    def _load_poi_file(self):
+        # input_poi_charger.csv (v11, written by
+        # build_chargers_real.py): one row per (POI, charger)
+        # pair. Only poi_node_id, charger_id and walk_dist_m are
+        # read here; price / parking_fee are carried for later
+        # use and ignored. A missing file is not an error: the
+        # opportunist falls back to the map's road-network walk
+        # test. Rows naming an unknown node number or an unknown
+        # station are skipped and counted in one stdout line.
+        path = os.path.join(self.world.dir, "input_poi_charger.csv")
+        if not os.path.exists(path):
+            return
+        parser = CsvParser(path)
+        skipped_node = 0
+        skipped_station = 0
+        while parser.read_record():
+            ok, node_number = parser.get("poi_node_id", "int")
+            if not ok:
+                skipped_node += 1
+                continue
+            node_id = self.world.node_index.get(node_number)
+            if node_id is None:
+                skipped_node += 1
+                continue
+            ok, station_id = parser.get("charger_id", "str")
+            if not ok or station_id not in self.sites_by_station:
+                skipped_station += 1
+                continue
+            ok, walk_m = parser.get("walk_dist_m", "float")
+            if not ok:
+                continue
+            per_node = self.poi_walk.setdefault(node_id, {})
+            if station_id not in per_node \
+                    or walk_m < per_node[station_id]:
+                per_node[station_id] = float(walk_m)
+        if skipped_node or skipped_station:
+            print("input_poi_charger.csv: skipped %d rows with "
+                  "unknown node and %d with unknown station"
+                  % (skipped_node, skipped_station))
+
+    def _dest_site(self, leg, arrival_time=None):
+        # The destination site for a leg, by live plug
+        # availability (v11): the site whose earliest-free plug
+        # is ready soonest. At decision time (decide_for_leg)
+        # the arrival is not known yet, so arrival_time None
+        # ranks by earliest-free plug alone; at charge time
+        # (apply_destination_charge) the true arrival is passed.
+        # A single site at the node returns unchanged, so
+        # single-row nodes behave exactly as v10.
         sites = self.by_node.get(leg.dest_node)
-        return sites[0] if sites else None
+        if not sites:
+            return None
+        if len(sites) == 1:
+            return sites[0]
+        if arrival_time is None:
+            arrival_time = 0.0
+        return select_site_by_availability(
+            sites, leg.dest_node, arrival_time)
 
     @staticmethod
     def _home_available(veh, leg):
@@ -425,7 +508,7 @@ class ChargingEngine:
             return None
         battery, _consumption = params
         soc_at_arrival = leg.soc_end_kwh
-        site = self._dest_site(leg)
+        site = self._dest_site(leg, arrival_time)
         home_available = self._home_available(veh, leg)
         if site is not None:
             charger_id = site.charger_id
@@ -705,7 +788,16 @@ class ChargingEngine:
         # sets veh.soc_kwh to the target here: nothing reads SoC
         # while it is parked.
         stop = leg.charger_stop
-        site = stop["site"]
+        # v11: the stop was planned at trigger time, but the plug
+        # is taken now: re-select among the rows at the stop node
+        # by live availability at this arrival. The node (and the
+        # via path through it) is unchanged; only the row can
+        # differ from the plan, and the event records the row
+        # actually used. Single-row nodes return the same site.
+        site = select_site_by_availability(
+            self.by_node.get(stop["site"].node_id, [stop["site"]]),
+            stop["site"].node_id, arrival_time)
+        stop["site"] = site
         params = world.ev_params(veh)
         battery, _consumption = params
         soc_at_stop = veh.soc_kwh
@@ -812,6 +904,14 @@ class ChargingEngine:
         target_kwh = self.config["tow_target_soc"] * battery
         tow_start = stranded_time + self.config["tow_dispatch_min"]
         arrival_charger = tow_start + travel_time
+        # v11: "which station" stays distance-based (best above);
+        # the plug at that station is availability-based at the
+        # tow's arrival. The node is unchanged, so the tow path
+        # and travel time still hold. Single-row nodes return the
+        # same site.
+        site = select_site_by_availability(
+            self.by_node.get(site.node_id, [site]),
+            site.node_id, arrival_charger)
         plug = min(range(site.plugs),
                    key=lambda p: site.plug_free[p])
         start = max(arrival_charger, site.plug_free[plug])
@@ -952,14 +1052,35 @@ def run_charging(world, output_dir, config):
         soc_end = soc_start - total_energy
         veh.soc_end_kwh = soc_end
         # Destination charging, v1 rule: if the destination node hosts
-        # a charger site (first site in file order when several do)
-        # and the vehicle is below that charger's target, it charges
-        # up to the target at the site's power. Queueing is accounting
-        # only: waiting time never delays the vehicle's trip.
+        # a charger site and the vehicle is below that charger's
+        # target, it charges up to the target at the site's power.
+        # Queueing is accounting only: waiting time never delays
+        # the vehicle's trip. v11: with several sites at the node,
+        # the site is picked by live plug availability at the
+        # vehicle's arrival. The pick must happen in the second
+        # loop below, at plug-assignment time: the first loop runs
+        # in agent-id order and no plug is booked until the second
+        # loop, so a pick made in the first loop would see every
+        # plug free and always take the fastest site. The second
+        # loop runs in arrival order, so plug_free holds every
+        # earlier-arriving vehicle's charge when each vehicle
+        # picks. The target depends on the picked site's power
+        # (fast 80%, slow 100%), so the "needs a charge" check is
+        # deferred to the second loop too; a single site returns
+        # unchanged, so single-row nodes behave as v10.
         node_sites = by_node.get(veh.dest_node)
         if not node_sites:
             continue
-        site = node_sites[0]
+        pending.append((float(veh.arrival), veh.agent_id, veh.tour_id,
+                        node_sites, soc_end, battery))
+    # FIFO queueing needs arrivals in chronological order, not
+    # agent-id order: sort first, then pick the site and assign
+    # plugs per site.
+    pending.sort(key=lambda p: (p[0], p[1]))
+    for arrival, agent_id, tour_id, node_sites, soc_end, battery \
+            in pending:
+        site = select_site_by_availability(
+            node_sites, node_sites[0].node_id, arrival)
         target_frac = cfg["target_soc_fast"] \
             if site.power_kw >= cfg["fast_threshold_kw"] \
             else cfg["target_soc_slow"]
@@ -968,13 +1089,6 @@ def run_charging(world, output_dir, config):
             continue
         energy = target_kwh - soc_end
         duration = energy / site.power_kw * 60.0
-        pending.append((float(veh.arrival), veh.agent_id, veh.tour_id,
-                        site, energy, duration, soc_end, target_kwh))
-    # FIFO queueing needs arrivals in chronological order, not
-    # agent-id order: sort first, then assign plugs per site.
-    pending.sort(key=lambda p: (p[0], p[1]))
-    for arrival, agent_id, tour_id, site, energy, duration, soc_end, \
-            target_kwh in pending:
         plug = min(range(site.plugs), key=lambda p: site.plug_free[p])
         start = max(arrival, site.plug_free[plug])
         wait = start - arrival

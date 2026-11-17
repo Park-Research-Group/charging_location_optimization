@@ -255,6 +255,22 @@ def _final_rows_v7(world, sim):
     return rows
 
 
+def _bool_value(arg, flag):
+    # Value of a --flag=true/false argument: True/False, or None
+    # (with an error printed) for anything else. v11: the
+    # --no-progress / --no-incremental / --no-vectorize flags
+    # accept =false to cancel them (--no-vectorize=false runs
+    # vectorized); before v11 the =value form was silently
+    # treated as a positional argument.
+    value = arg.split("=", 1)[1].strip().lower()
+    if value in ("true", "1", "yes"):
+        return True
+    if value in ("false", "0", "no"):
+        return False
+    print("python -m pysim.run: %s needs true or false" % flag)
+    return None
+
+
 def main(argv):
     # Optional --workers N (or --workers=N) after the two positional
     # arguments; plain `python -m pysim.run <in> <out>` is unchanged
@@ -294,11 +310,29 @@ def main(argv):
         elif arg == "--no-progress":
             progress = False
             i += 1
+        elif arg.startswith("--no-progress="):
+            value = _bool_value(arg, "--no-progress")
+            if value is None:
+                return 2
+            progress = not value
+            i += 1
         elif arg == "--no-incremental":
             incremental = False
             i += 1
+        elif arg.startswith("--no-incremental="):
+            value = _bool_value(arg, "--no-incremental")
+            if value is None:
+                return 2
+            incremental = not value
+            i += 1
         elif arg == "--no-vectorize":
             vectorize = False
+            i += 1
+        elif arg.startswith("--no-vectorize="):
+            value = _bool_value(arg, "--no-vectorize")
+            if value is None:
+                return 2
+            vectorize = not value
             i += 1
         elif arg == "--flush-legs" and i + 1 < len(argv):
             try:
@@ -329,6 +363,12 @@ def main(argv):
                 return 2
             i += 1
         else:
+            if arg.startswith("--"):
+                # v11: an unknown option fails loud instead of
+                # silently becoming a positional argument (which
+                # used to misroute the input/output dirs).
+                print("python -m pysim.run: unknown option %s" % arg)
+                return 2
             args.append(arg)
             i += 1
     if len(args) < 2:

@@ -41,6 +41,12 @@ class Simulator:
         # recreated the link state (see _s3_ensure). None until
         # then; untouched on the --no-vectorize path.
         self._s3 = None
+        # v11: the loading pass the mirror belongs to. Bumped at
+        # the start of every network_loading, so a mirror left
+        # over from an earlier pass is never synced back over a
+        # later pass's counters (Issue 1) and a rebuild never
+        # copies a previous pass's values.
+        self._s3_gen = 0
         # Time of the most recent step, for the progress file
         # (and team 2's bar); None before loading starts.
         self.current_time = None
@@ -633,6 +639,14 @@ class Simulator:
 
     def network_loading(self):
         world = self.world
+        # v11: a new loading pass starts a new mirror generation
+        # (see _s3_gen). A non-vectorized pass drops the mirror
+        # outright: its Python loops own the link counters, and
+        # the end-of-run sync must not resurrect the previous
+        # pass's mirror values (Issue 1).
+        self._s3_gen += 1
+        if not self.vectorize:
+            self._s3 = None
         for link in world.links:
             link.setup_loading(world.horizon, world.min_inflow_ratio)
         self.freeway_links = [link for link in world.links
@@ -667,83 +681,89 @@ class Simulator:
         step = 0
         time = float(world.start)
         limit = min(world.horizon, world.horizon)
-        while time < limit:
-            time = world.start + step * SIM_INTERVAL
-            time_int = int(time * 10)
-            if time_int in world.original_td_map:
-                self.td_map[time_int] = list(world.original_td_map[time_int])
-            step += 1
-        # Early-exit bookkeeping. n_generatable counts, once, every
-        # leg (tour mode) or vehicle (legacy) that can ever be
-        # generated and completed: stage 0 loads only node_size >= 2
-        # legs / vehicles, and node_size is final at this point
-        # (iteration-0 assignment already ran; the real-time
-        # adjustments rewrite only loaded or in-transit vehicles and
-        # keep node_size >= 2, so nothing can join the generatable
-        # set later). In tour mode every leg counts, including
-        # intrazonal instant legs: an instant leg starts and finishes
-        # atomically in stage 0, so it increments both generated and
-        # completed when it fires. Real legs increment generated at
-        # generation and completed at completion, as before. The
-        # count is therefore exact for the generated set and a
-        # superset of the completed set: a counted leg that never
-        # completes (permanent gridlock) simply keeps the break from
-        # firing, and generated == completed == n_generatable implies
-        # every leg started and finished.
-        self.n_generatable = 0
-        for agent_id in world.vehicle_order:
-            veh = world.vehicles[agent_id]
-            if veh.legs:
-                self.n_generatable += len(veh.legs)
-            elif veh.node_size >= 2:
-                self.n_generatable += 1
-        self._early_exit_vetoed = False
-        if self.bar is not None:
-            # The loading phase change is announced here, not in
-            # run.py: the leg total is known only now, so the
-            # first bar line can already show legs 0/total.
-            self.bar.set_phase("loading", total=self.n_generatable)
-        # Main loop: stops early once the network is drained (see the
-        # break below). horizon = loading end + 300.
-        step = 0
-        time = float(world.start)
-        while time < limit:
-            time = world.start + step * SIM_INTERVAL
-            self.step(time, step)
-            step_no = step
-            step += 1
+        try:
+            while time < limit:
+                time = world.start + step * SIM_INTERVAL
+                time_int = int(time * 10)
+                if time_int in world.original_td_map:
+                    self.td_map[time_int] = list(world.original_td_map[time_int])
+                step += 1
+            # Early-exit bookkeeping. n_generatable counts, once, every
+            # leg (tour mode) or vehicle (legacy) that can ever be
+            # generated and completed: stage 0 loads only node_size >= 2
+            # legs / vehicles, and node_size is final at this point
+            # (iteration-0 assignment already ran; the real-time
+            # adjustments rewrite only loaded or in-transit vehicles and
+            # keep node_size >= 2, so nothing can join the generatable
+            # set later). In tour mode every leg counts, including
+            # intrazonal instant legs: an instant leg starts and finishes
+            # atomically in stage 0, so it increments both generated and
+            # completed when it fires. Real legs increment generated at
+            # generation and completed at completion, as before. The
+            # count is therefore exact for the generated set and a
+            # superset of the completed set: a counted leg that never
+            # completes (permanent gridlock) simply keeps the break from
+            # firing, and generated == completed == n_generatable implies
+            # every leg started and finished.
+            self.n_generatable = 0
+            for agent_id in world.vehicle_order:
+                veh = world.vehicles[agent_id]
+                if veh.legs:
+                    self.n_generatable += len(veh.legs)
+                elif veh.node_size >= 2:
+                    self.n_generatable += 1
+            self._early_exit_vetoed = False
             if self.bar is not None:
-                # Per-step loading tick (design section 9.4): the
-                # bar throttles itself, so this is one cheap check
-                # per step and an emission at most twice a minute.
-                self.bar.tick_loading(
-                    time, self.completed, self.n_generatable,
-                    self.progress.started_mono
-                    if self.progress is not None else None)
-            # Early exit. Every clause is an O(1) integer/float compare.
-            # time > world.end: every registered departure lies in
-            # [start, end] (read time rejects anything outside), and each
-            # departure bucket is visited exactly once as the clock
-            # advances, so past end no vehicle can still be generated.
-            # step_no % 10 == 0: the break step is a minute boundary, so
-            # stage 5 has just written this minute's MOE from final flows
-            # and the post-pass propagates those finals over the tail.
-            # generated == completed == n_generatable: every generatable
-            # leg / vehicle entered the network and reached its destination.
-            if not self._early_exit_vetoed and time > world.end and \
-                    step_no % 10 == 0 and \
-                    self.generated == self.n_generatable and \
-                    self.completed == self.n_generatable:
-                # Belt-and-braces veto scan: ground truth for "nothing in
-                # transit" is the queue system itself (a generated vehicle
-                # sits in exactly one of loading_buffer, entrance_queue,
-                # exit_queue until its completion pop). It runs at most
-                # once: a veto disables all later checks and the run
-                # continues to the horizon, outputs identical to unpatched.
-                if self._queues_empty():
-                    break
-                self._early_exit_vetoed = True
-        self._s3_sync_links()
+                # The loading phase change is announced here, not in
+                # run.py: the leg total is known only now, so the
+                # first bar line can already show legs 0/total.
+                self.bar.set_phase("loading", total=self.n_generatable)
+            # Main loop: stops early once the network is drained (see the
+            # break below). horizon = loading end + 300.
+            step = 0
+            time = float(world.start)
+            while time < limit:
+                time = world.start + step * SIM_INTERVAL
+                self.step(time, step)
+                step_no = step
+                step += 1
+                if self.bar is not None:
+                    # Per-step loading tick (design section 9.4): the
+                    # bar throttles itself, so this is one cheap check
+                    # per step and an emission at most twice a minute.
+                    self.bar.tick_loading(
+                        time, self.completed, self.n_generatable,
+                        self.progress.started_mono
+                        if self.progress is not None else None)
+                # Early exit. Every clause is an O(1) integer/float compare.
+                # time > world.end: every registered departure lies in
+                # [start, end] (read time rejects anything outside), and each
+                # departure bucket is visited exactly once as the clock
+                # advances, so past end no vehicle can still be generated.
+                # step_no % 10 == 0: the break step is a minute boundary, so
+                # stage 5 has just written this minute's MOE from final flows
+                # and the post-pass propagates those finals over the tail.
+                # generated == completed == n_generatable: every generatable
+                # leg / vehicle entered the network and reached its destination.
+                if not self._early_exit_vetoed and time > world.end and \
+                        step_no % 10 == 0 and \
+                        self.generated == self.n_generatable and \
+                        self.completed == self.n_generatable:
+                    # Belt-and-braces veto scan: ground truth for "nothing in
+                    # transit" is the queue system itself (a generated vehicle
+                    # sits in exactly one of loading_buffer, entrance_queue,
+                    # exit_queue until its completion pop). It runs at most
+                    # once: a veto disables all later checks and the run
+                    # continues to the horizon, outputs identical to unpatched.
+                    if self._queues_empty():
+                        break
+                    self._early_exit_vetoed = True
+        finally:
+            # v11: an exception mid-run must not leave
+            # the link counters stale in the mirror; sync
+            # whatever the mirror holds before the
+            # exception propagates.
+            self._s3_sync_links()
         self._post_loading()
 
     def _queues_empty(self):
@@ -1441,18 +1461,34 @@ class Simulator:
         # reads and writes the old lists did, so the Python path
         # keeps working unchanged on rows, and the vectorized
         # path reads/writes whole columns. Rebuild triggers:
-        # first use, a different link list, or setup_loading
-        # having recreated the ring lists (the token is the
-        # list-or-row object link 0 currently carries). A
-        # rebuild copies the links' current values, so a
-        # Simulator that steps after another Simulator re-linked
-        # the rows still sees the true state.
+        # first use, a different link list, a changed link count
+        # (a link appended after the mirror was built), or
+        # setup_loading having recreated the ring lists (the
+        # token is the list-or-row object link 0 currently
+        # carries). A rebuild copies the links' current values,
+        # so a Simulator that steps after another Simulator
+        # re-linked the rows still sees the true state. v11: the
+        # mirror also carries its pass generation, so a mirror
+        # from an earlier pass never reuses (it is rebuilt from
+        # the reset links instead), and a same-pass rebuild syncs
+        # the old mirror's counters back first, so it cannot
+        # rewind them (Finding 1).
         cache = self._s3
-        if cache is not None and cache["links"] is links:
+        if cache is not None and cache["gen"] == self._s3_gen \
+                and cache["links"] is links \
+                and cache["n"] == len(links):
             if not links:
                 return cache
             if cache["ring_token"] is links[0].ring_arrival:
                 return cache
+        if cache is not None and cache["gen"] == self._s3_gen:
+            # Same-pass rebuild: the old mirror's counters are
+            # newer than the links', so sync them back before
+            # the new mirror copies the links. A previous pass's
+            # mirror is discarded without syncing: setup_loading
+            # already reset the links for this pass, and its
+            # values must not come back.
+            self._s3_sync_links()
         n = len(links)
         consts = [link.s3_consts for link in links]
         ring_arr = np.zeros((n, 301), dtype=np.float32)
@@ -1468,6 +1504,8 @@ class Simulator:
             [bool(link.on_ramp) for link in links], dtype=bool)
         cache = {
             "links": links,
+            "gen": self._s3_gen,
+            "n": n,
             "ring_token": links[0].ring_arrival if links else None,
             "cap": np.array([c[0] for c in consts], dtype=np.float64),
             "cap_relax": np.array([c[1] for c in consts],
@@ -1513,8 +1551,13 @@ class Simulator:
         # end of network_loading; a no-op when the vectorized
         # path never ran. The ring buffers need no sync: the
         # links' ring lists ARE the mirror rows (see _s3_ensure).
+        # v11: only a mirror from the current pass is synced. A
+        # leftover mirror from an earlier pass must never
+        # overwrite this pass's counters (Issue 1): a
+        # non-vectorized pass clears _s3 at its start, and a new
+        # pass bumps _s3_gen, so a stale mirror fails this check.
         s3 = self._s3
-        if s3 is None:
+        if s3 is None or s3.get("gen") != self._s3_gen:
             return
         for link, co, ci, cpo, cpi in zip(
                 s3["links"], s3["cum_out"], s3["cum_in"],
@@ -1528,6 +1571,14 @@ class Simulator:
         # The v9 stage-3 loop, verbatim (moved out of step so
         # the vectorized path can dispatch to it). Runs when
         # vectorize is False (--no-vectorize).
+        # v11: a mid-run flip from the vectorized path leaves the
+        # live counters in the mirror, not on the links: sync a
+        # current mirror back, then drop it, so this loop reads
+        # the true counters (Issue 2). A stale mirror is dropped
+        # without syncing (_s3_sync_links no-ops on it).
+        if self._s3 is not None:
+            self._s3_sync_links()
+            self._s3 = None
         world = self.world
         # stage 3: link in/out capacities (Newell only). Plain-float
         # arithmetic on the per-link constants precomputed in
