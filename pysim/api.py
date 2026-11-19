@@ -18,7 +18,7 @@ from .run import run_loading
 def run_pysim(input_dir, output_dir, verbose=False, reroute_callback=None,
               charging=None, workers=None, incremental=True,
               progress=True, flush_legs=None, flush_sim_minutes=None,
-              vectorize=True):
+              vectorize=True, days=None):
     """Run one PySim loading pass.
 
     input_dir is a directory holding DTALite-format input files. It is
@@ -89,7 +89,7 @@ def run_pysim(input_dir, output_dir, verbose=False, reroute_callback=None,
                         incremental=incremental, progress=progress,
                         flush_legs=flush_legs,
                         flush_sim_minutes=flush_sim_minutes,
-                        vectorize=vectorize)
+                        vectorize=vectorize, days=days)
     agents = len(world.vehicles)
     completed = sum(1 for veh in world.vehicles.values() if veh.complete)
     outputs = {

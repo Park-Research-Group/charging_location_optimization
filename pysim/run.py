@@ -19,7 +19,7 @@ from .progress import ProgressBar, RunProgress
 def run_loading(input_dir, output_dir, reroute_callback=None,
                 charging=None, workers=None, incremental=True,
                 progress=True, flush_legs=None, flush_sim_minutes=None,
-                vectorize=True):
+                vectorize=True, days=None):
     # incremental=True (default) writes outputs as legs complete
     # (v8); False restores exact v7 behaviour (all end-of-run
     # writers). progress is the console-bar switch: the progress
@@ -40,6 +40,24 @@ def run_loading(input_dir, output_dir, reroute_callback=None,
             "pysim implements a single loading pass; the scenario requests "
             "%d assignment iterations" % (world.num_iterations + 1))
     world.read_inputs()
+    # --days N (v13.1): cap the loading horizon to the first N
+    # days of demand, keeping the 300-minute drain buffer the
+    # horizon always carries (horizon = end + 300). The demand
+    # file is read whole, so legs past the cap are simply never
+    # generated; everything downstream (progress bar, Simulator,
+    # incremental writer) reads world.horizon, so capping it
+    # here is enough. A cap at or beyond the full horizon is a
+    # no-op. The assignment-period arrays were sized for the
+    # full horizon in World.__init__; the sim only ever queries
+    # times below the capped horizon, so the oversized prefix
+    # is correct and the tail is never consulted.
+    if days is not None:
+        if not isinstance(days, int) or isinstance(days, bool) \
+                or days < 1:
+            raise ProgramStop(
+                "--days needs a positive integer number of days")
+        world.horizon = min(world.horizon,
+                            world.start + days * 1440 + 300)
     # Charging accounting config, resolved before simulation starts:
     # charging=None means auto (runs when input_charger.csv is
     # present, with default parameters); charging=False disables it
@@ -289,6 +307,7 @@ def main(argv):
     progress = True
     flush_legs = None
     flush_sim_minutes = None
+    days = None
     args = []
     i = 1
     while i < len(argv):
@@ -362,6 +381,26 @@ def main(argv):
                 print("python -m pysim.run: --flush-minutes needs a number")
                 return 2
             i += 1
+        elif arg == "--days" and i + 1 < len(argv):
+            try:
+                days = int(argv[i + 1])
+                if days < 1:
+                    raise ValueError
+            except ValueError:
+                print("python -m pysim.run: --days needs a "
+                      "positive integer number of days")
+                return 2
+            i += 2
+        elif arg.startswith("--days="):
+            try:
+                days = int(arg.split("=", 1)[1])
+                if days < 1:
+                    raise ValueError
+            except ValueError:
+                print("python -m pysim.run: --days needs a "
+                      "positive integer number of days")
+                return 2
+            i += 1
         else:
             if arg.startswith("--"):
                 # v11: an unknown option fails loud instead of
@@ -375,13 +414,13 @@ def main(argv):
         print("usage: python -m pysim.run <input_dir> <output_dir> "
               "[--workers N] [--no-progress] [--no-incremental] "
               "[--flush-legs N] [--flush-minutes M] "
-              "[--no-vectorize]")
+              "[--no-vectorize] [--days N]")
         return 2
     run_loading(args[0], args[1], workers=workers,
                 incremental=incremental, progress=progress,
                 flush_legs=flush_legs,
                 flush_sim_minutes=flush_sim_minutes,
-                vectorize=vectorize)
+                vectorize=vectorize, days=days)
     return 0
 
 
