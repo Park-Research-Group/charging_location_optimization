@@ -47,17 +47,30 @@ def run_loading(input_dir, output_dir, reroute_callback=None,
     # generated; everything downstream (progress bar, Simulator,
     # incremental writer) reads world.horizon, so capping it
     # here is enough. A cap at or beyond the full horizon is a
-    # no-op. The assignment-period arrays were sized for the
-    # full horizon in World.__init__; the sim only ever queries
-    # times below the capped horizon, so the oversized prefix
-    # is correct and the tail is never consulted.
+    # no-op.
     if days is not None:
         if not isinstance(days, int) or isinstance(days, bool) \
                 or days < 1:
             raise ProgramStop(
                 "--days needs a positive integer number of days")
-        world.horizon = min(world.horizon,
-                            world.start + days * 1440 + 300)
+        # Cap the demand window AND the horizon, then rebuild
+        # the assignment periods from the capped window. The
+        # periods were sized for the full horizon in
+        # World.__init__; without the rebuild, num_periods
+        # still spans the full horizon while the SP table's
+        # rebuild walk stops at the capped horizon, leaving
+        # the tail columns at the 0.01 default -- and the
+        # memoization tripwire (which reads the last column)
+        # then trips, disabling the SP cache and the worker
+        # pool and forcing one serial search per leg. Capping
+        # end as well keeps the last interval's length (and
+        # the end-relative clamps) consistent; the readers
+        # already validated departures against the full end,
+        # so capping it here rejects nothing already loaded.
+        # A cap at or beyond the full window is a no-op.
+        world.end = min(world.end, world.start + days * 1440)
+        world.horizon = min(world.horizon, world.end + 300)
+        world._build_assignment_periods()
     # Charging accounting config, resolved before simulation starts:
     # charging=None means auto (runs when input_charger.csv is
     # present, with default parameters); charging=False disables it
