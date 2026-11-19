@@ -15,6 +15,7 @@
 # dimensions (SoC, distance remaining to charger, charger at end
 # location, home charging, ...); the string dispatch here is the
 # seam that will take the vector.
+from .consumption import links_energy_kwh
 from .cpp import ProgramStop, f32
 from .sp import find_best_path, find_best_paths_forward, \
     find_best_paths_reverse, multi_run_valid
@@ -22,12 +23,22 @@ from .sp import find_best_path, find_best_paths_forward, \
 KM_PER_MILE = 1.60934  # DTALite link lengths are in miles
 
 
-def leg_free_flow_energy(world, leg, consumption):
+def leg_free_flow_energy(world, leg, consumption, battery_kwh=None):
     # Free-flow energy of the leg's assigned path: sum over its
     # links (the trailing 65530 sentinel is not a link). 0.0 for a
-    # leg with fewer than 2 nodes.
+    # leg with fewer than 2 nodes. consumption is the FALLBACK rate
+    # (the vehicle type's configured kWh/km, or 0.18): with
+    # battery_kwh given, each link is charged at its own lookup
+    # rate (speed + slope + vehicle class) and the fallback
+    # applies only to links with no slope; with battery_kwh None
+    # the old flat sum runs, exactly as v12.
     if leg.node_size < 2 or not leg.link_ary:
         return 0.0
+    if battery_kwh is not None:
+        return links_energy_kwh(
+            world, [entry.link_no for entry in leg.link_ary[:-1]
+                    if entry.link_no != 65530],
+            battery_kwh, consumption)
     total = 0.0
     for entry in leg.link_ary[:-1]:
         if entry.link_no == 65530:
@@ -48,17 +59,23 @@ def _path_energy_time(world, ff_net, origin_zone, origin, departure,
     if node_size < 2:
         return 0, [], 0.0, 0.0
     params = world.ev_params(veh)
-    consumption = params[1] if params is not None else 0.0
-    energy = 0.0
-    for link_no in path_links:
-        energy += float(world.links[link_no].length) * KM_PER_MILE \
-            * consumption
+    if params is None:
+        return node_size, path_links, 0.0, float(total_cost)
+    # v13: per-link lookup rates (battery class + link speed and
+    # slope), falling back per link to the type's configured rate.
+    energy = links_energy_kwh(world, path_links, params[0], params[1])
     return node_size, path_links, energy, float(total_cost)
 
 
-def _links_energy(world, path_links, consumption):
+def _links_energy(world, path_links, consumption, battery_kwh=None):
     # Free-flow energy of a link list, summed in path order
-    # exactly as _path_energy_time sums a query's path.
+    # exactly as _path_energy_time sums a query's path. Same
+    # contract as leg_free_flow_energy: battery_kwh selects the
+    # per-link lookup (fallback = consumption), None keeps the
+    # flat v12 sum.
+    if battery_kwh is not None:
+        return links_energy_kwh(world, path_links, battery_kwh,
+                                consumption)
     energy = 0.0
     for link_no in path_links:
         energy += float(world.links[link_no].length) * KM_PER_MILE \
@@ -129,7 +146,8 @@ def _find_enroute_charger_multi(world, ff_net, veh, leg, soc_kwh,
             continue
         _n1, links_to, total_cost = got
         time1 = float(total_cost)
-        if _links_energy(world, links_to, consumption) > soc_kwh:
+        if _links_energy(world, links_to, consumption, battery) \
+                > soc_kwh:
             continue
         first[site.node_id] = (links_to, time1)
     if not first:
@@ -151,8 +169,8 @@ def _find_enroute_charger_multi(world, ff_net, veh, leg, soc_kwh,
         links_to, time1 = got
         time2 = _path_time(world, ff_net, links_from,
                            int(departure + time1))
-        if _links_energy(world, links_from, consumption) > \
-                target_soc_frac * battery:
+        if _links_energy(world, links_from, consumption, battery) \
+                > target_soc_frac * battery:
             continue
         total_time = time1 + time2
         if best_time is None or total_time < best_time - 1e-9 or \
@@ -279,11 +297,13 @@ def _links_dist_km(world, path_links):
 
 
 def _trigger_sp_leg(world, ff_net, origin, dest, departure,
-                    consumption, demand_type, vot):
+                    consumption, demand_type, vot, battery_kwh=None):
     # (links, energy_kwh, time_min, reachable) for the free-flow
     # shortest path origin -> dest. origin == dest is reachable
     # with an empty path (the agent is already there); any other
-    # missing path is unreachable.
+    # missing path is unreachable. battery_kwh selects the
+    # per-link lookup (see _links_energy); None keeps the flat
+    # v12 energy.
     if origin == dest:
         return [], 0.0, 0.0, True
     origin_zone = world.nodes[origin].zone_id
@@ -293,7 +313,8 @@ def _trigger_sp_leg(world, ff_net, origin, dest, departure,
         dest_zone, dest, demand_type, vot)
     if node_size < 2:
         return [], 0.0, 0.0, False
-    return links, _links_energy(world, links, consumption), \
+    return links, _links_energy(world, links, consumption,
+                                battery_kwh), \
         float(total_cost), True
 
 
@@ -445,7 +466,7 @@ def choose_charger_for_trigger(nearest_map, trigger, from_node, dest_node,
                 node = map_site.node_id
             links_to, energy_to, time_to, ok = _trigger_sp_leg(
                 world, ff_net, from_node, node, departure,
-                consumption, demand_type, vot)
+                consumption, demand_type, vot, battery_kwh)
             if not ok or energy_to > soc_kwh + 1e-9:
                 return None
             site = select_site_by_availability(
@@ -453,7 +474,7 @@ def choose_charger_for_trigger(nearest_map, trigger, from_node, dest_node,
             links_from, energy_from, time_from, ok = _trigger_sp_leg(
                 world, ff_net, node, dest_node,
                 int(departure + time_to), consumption,
-                demand_type, vot)
+                demand_type, vot, battery_kwh)
             if not ok or energy_from > \
                     target_soc_frac * battery_kwh + 1e-9:
                 return None
@@ -461,7 +482,10 @@ def choose_charger_for_trigger(nearest_map, trigger, from_node, dest_node,
         links_to = nearest_map.path_to_charger(from_node)
         if links_to is None:
             return None
-        if nearest_map.dist_km[from_node] * consumption \
+        # v13: reachability on the map path's own per-link energy,
+        # not dist_km x flat rate (same number when no link has a
+        # slope, up to float summation order).
+        if _links_energy(world, links_to, consumption, battery_kwh) \
                 > soc_kwh + 1e-9:
             return None
         time_to = nearest_map.time_min[from_node]
@@ -475,8 +499,8 @@ def choose_charger_for_trigger(nearest_map, trigger, from_node, dest_node,
             departure + time_to)
         links_from, energy_from, time_from, ok = _trigger_sp_leg(
             world, ff_net, map_site.node_id, dest_node,
-            int(departure + time_to), consumption,
-            demand_type, vot)
+            int(departure + time_to), consumption, demand_type, vot,
+            battery_kwh)
         if not ok or energy_from > \
                 target_soc_frac * battery_kwh + 1e-9:
             return None
@@ -520,7 +544,7 @@ def choose_charger_for_trigger(nearest_map, trigger, from_node, dest_node,
     if poi_node is not None:
         _l, _e, t, ok = _trigger_sp_leg(
             world, ff_net, lookup, poi_node, departure,
-            consumption, demand_type, vot)
+            consumption, demand_type, vot, battery_kwh)
         if not ok:
             return None
         best_time = t
@@ -534,7 +558,7 @@ def choose_charger_for_trigger(nearest_map, trigger, from_node, dest_node,
         for idx, site in enumerate(sites):
             _l, _e, t, ok = _trigger_sp_leg(
                 world, ff_net, lookup, site.node_id, departure,
-                consumption, demand_type, vot)
+                consumption, demand_type, vot, battery_kwh)
             if not ok:
                 continue
             if best_time is None or t < best_time - 1e-9 or \
@@ -553,12 +577,13 @@ def choose_charger_for_trigger(nearest_map, trigger, from_node, dest_node,
             return None
         links_to, energy_to, time_to, ok = _trigger_sp_leg(
             world, ff_net, from_node, site.node_id, departure,
-            consumption, demand_type, vot)
+            consumption, demand_type, vot, battery_kwh)
         if not ok or energy_to > soc_kwh + 1e-9:
             return None
     else:
         links_to = lookup_links
-        energy_to = _links_energy(world, links_to, consumption)
+        energy_to = _links_energy(world, links_to, consumption,
+                                  battery_kwh)
         time_to = best_time
         if energy_to > soc_kwh + 1e-9:
             return None
@@ -570,8 +595,8 @@ def choose_charger_for_trigger(nearest_map, trigger, from_node, dest_node,
         sites, site.node_id, departure + time_to)
     links_from, energy_from, time_from, ok = _trigger_sp_leg(
         world, ff_net, site.node_id, dest_node,
-        int(departure + time_to), consumption,
-        demand_type, vot)
+        int(departure + time_to), consumption, demand_type, vot,
+        battery_kwh)
     if not ok or energy_from > \
             target_soc_frac * battery_kwh + 1e-9:
         return None

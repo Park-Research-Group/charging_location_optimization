@@ -8,6 +8,7 @@ import math
 import numpy as np
 
 from .charging import KM_PER_MILE, _format_decision_row
+from .consumption import link_energy_kwh
 from .cpp import ProgramStop, f32, floating_less, less_eq
 from .network import VehicleLink
 from .outputs import _format_agent_leg_row, _format_agent_vehicle_row
@@ -857,7 +858,10 @@ class Simulator:
         if leg is not None and leg.depleted:
             return
         _battery, consumption = params
-        use = float(link.length) * KM_PER_MILE * consumption
+        # v13: per-link lookup rate (battery class + this link's
+        # speed and slope); no slope on the link falls back to
+        # the type's configured rate, exactly as v12.
+        use = link_energy_kwh(link, _battery, consumption)
         remaining = veh.soc_kwh - use
         if remaining < -1e-9:
             veh.soc_kwh = 0.0
@@ -985,7 +989,7 @@ class Simulator:
         remaining = 0.0
         for later_leg in later:
             remaining += engine._leg_energy(self.world, later_leg,
-                                            consumption)
+                                            consumption, battery)
         if remaining <= 0:
             return
         if not veh.soc_kwh < remaining:

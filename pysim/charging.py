@@ -18,6 +18,7 @@
 import heapq
 import os
 
+from .consumption import link_energy_kwh, links_energy_kwh
 from .cpp import CsvParser, ProgramStop
 from .decision import choose_charger_for_trigger, decide_charging, \
     _links_energy, leg_free_flow_energy, select_site_by_availability
@@ -120,17 +121,25 @@ def _ev_params(world, veh):
     return battery, consumption
 
 
-def stranding_point(world, leg, soc_start, consumption):
+def stranding_point(world, leg, soc_start, consumption,
+                    battery_kwh=None):
     # Node number where a leg strands: walk its links accumulating
     # energy from soc_start; the stranded node is the to-node of
     # the first link whose cumulative use exceeds soc_start.
     # None if the leg's energy never exceeds soc_start.
+    # battery_kwh selects the per-link lookup (fallback =
+    # consumption); None keeps the flat v12 walk.
     cumulative = 0.0
     for entry in leg.link_ary[:-1]:
         if entry.link_no == 65530:
             continue
         link = world.links[entry.link_no]
-        cumulative += float(link.length) * KM_PER_MILE * consumption
+        if battery_kwh is not None:
+            cumulative += link_energy_kwh(link, battery_kwh,
+                                          consumption)
+        else:
+            cumulative += float(link.length) * KM_PER_MILE \
+                * consumption
         if cumulative > soc_start:
             return world.nodes[link.to_id].number
     return None
@@ -352,7 +361,8 @@ class ChargingEngine:
     def _home_available(veh, leg):
         return leg.trip_purpose == "home" and veh.home_charger == 1
 
-    def _leg_energy(self, world, leg, consumption):
+    def _leg_energy(self, world, leg, consumption,
+                    battery_kwh=None):
         # Free-flow energy of a leg's current path, cached per
         # leg: decide_for_leg sums the energies of all later
         # legs for every leg, so without the cache each leg's
@@ -365,18 +375,22 @@ class ChargingEngine:
         # is recomputed. A cached value is the same sum
         # leg_free_flow_energy computes, and the remaining sums
         # re-add cached values in the same order, so the
-        # results are exactly identical.
+        # results are exactly identical. battery_kwh is part of
+        # the key: the same leg at another battery class has a
+        # different lookup energy.
         ary = leg.link_ary
         if ary is None:
             return 0.0
         hit = self._leg_energy_cache.get(id(leg))
         if hit is not None and hit[0] is ary \
                 and hit[1] == len(ary) \
-                and hit[2] == consumption:
-            return hit[3]
-        energy = leg_free_flow_energy(world, leg, consumption)
+                and hit[2] == consumption \
+                and hit[3] == battery_kwh:
+            return hit[4]
+        energy = leg_free_flow_energy(world, leg, consumption,
+                                      battery_kwh)
         self._leg_energy_cache[id(leg)] = \
-            (ary, len(ary), consumption, energy)
+            (ary, len(ary), consumption, battery_kwh, energy)
         return energy
 
     def decide_for_leg(self, world, veh, leg):
@@ -395,12 +409,14 @@ class ChargingEngine:
             return ("none", None, 0.0)
         battery, consumption = params
         soc = leg.soc_start_kwh
-        leg_energy = self._leg_energy(world, leg, consumption)
+        leg_energy = self._leg_energy(world, leg, consumption,
+                                      battery)
         # Planning estimate: later legs' paths were assigned at
         # iteration 0, so their free-flow energies are known now.
         remaining = 0.0
         for later in veh.legs[veh.current_leg:]:
-            remaining += self._leg_energy(world, later, consumption)
+            remaining += self._leg_energy(world, later, consumption,
+                                          battery)
         dest_site = self._dest_site(leg)
         home_available = self._home_available(veh, leg)
         # Plan-ahead pending via (v5): a stop planned when the
@@ -420,9 +436,11 @@ class ChargingEngine:
             leg.pending_via = None
             if _via_matches_leg(world, site, links_to, links_from,
                                 leg) and \
-                    _links_energy(world, links_to, consumption) \
+                    _links_energy(world, links_to, consumption,
+                                  battery) \
                     <= soc + 1e-9 and \
-                    _links_energy(world, links_from, consumption) \
+                    _links_energy(world, links_from, consumption,
+                                  battery) \
                     <= leg.enroute_target_soc * battery + 1e-9:
                 leg.enroute_via = (links_to, links_from, via_time)
                 leg.decision = "enroute"
@@ -768,7 +786,8 @@ class ChargingEngine:
             return None
         # The stay must suffice to complete the leg: charging here
         # to the target and then driving direct must be possible.
-        if leg_free_flow_energy(world, leg, consumption) > target_kwh:
+        if leg_free_flow_energy(world, leg, consumption, battery) \
+                > target_kwh:
             return None
         # Same plug the dwell charge used (the previous leg's); a
         # HOME charge has no plug and starts at D_next.
@@ -993,13 +1012,10 @@ class ChargingEngine:
         # departure), not the charge at this stranding: a second
         # stranding on the same leg repeats the leg-start value,
         # not the tow-restored charge.
-        trip_energy = 0.0
-        for entry in veh.link_ary[:-1]:
-            if entry.link_no == 65530:
-                continue
-            link = world.links[entry.link_no]
-            trip_energy += float(link.length) * KM_PER_MILE \
-                * consumption
+        trip_energy = links_energy_kwh(
+            world, [entry.link_no for entry in veh.link_ary[:-1]
+                    if entry.link_no != 65530],
+            battery, consumption)
         blockage = "%d->%d" % (
             world.nodes[stranded_link.from_id].number,
             world.nodes[stranded_link.to_id].number)
@@ -1035,10 +1051,11 @@ class ChargingEngine:
         node = leg.stranded_node
         if node is None:
             node = stranding_point(world, leg, leg.soc_start_kwh,
-                                   consumption)
+                                   consumption, _battery)
         if node is None:
             node = world.nodes[leg.dest_node].number
-        trip_energy = leg_free_flow_energy(world, leg, consumption)
+        trip_energy = leg_free_flow_energy(world, leg, consumption,
+                                           _battery)
         # soc_start_kwh is the LEG-START SoC (see tow_vehicle):
         # an untowed stranding after the tow cap repeats it too.
         self.stranded.append((veh.agent_id, veh.tour_id, node,
@@ -1092,11 +1109,13 @@ def run_charging(world, output_dir, config):
         veh.soc_start_kwh = soc_start
         # Walk the travelled links, deducting energy. The first link
         # whose cumulative use exceeds the starting charge strands
-        # the vehicle at that link's to-node.
+        # the vehicle at that link's to-node. v13: per-link lookup
+        # rates (battery class + link speed and slope), falling
+        # back per link to the type's configured rate.
         uses = []
         for j in range(veh.node_size - 1):
             link = world.links[veh.link_ary[j].link_no]
-            uses.append(float(link.length) * KM_PER_MILE * consumption)
+            uses.append(link_energy_kwh(link, battery, consumption))
         total_energy = sum(uses)
         cumulative = 0.0
         hit_zero = None
