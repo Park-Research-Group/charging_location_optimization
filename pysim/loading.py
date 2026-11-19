@@ -357,6 +357,12 @@ class Simulator:
         # decision already verified the site is viable, so a via
         # path that fails validation here is an internal
         # inconsistency and raises instead of falling back.
+        # v12: the plan-ahead path re-validates a stored via in
+        # full at consumption (charging.decide_for_leg), so a
+        # stale plan can no longer reach this raise; what reaches
+        # it is built fresh in this generation call or fully
+        # re-validated, and a failure here is a genuine internal
+        # inconsistency, not a stale plan.
         world = self.world
         links = world.links
         via = list(links_to) + list(links_from)
@@ -994,8 +1000,22 @@ class Simulator:
         from .decision import choose_charger_for_trigger
         departure = d_next if d_next is not None \
             else float(leg.arrival_actual)
+        # v12: plan from the TARGET leg's origin, not from this
+        # leg's destination. The via is consumed at the target
+        # leg's generation, where _build_via_path requires its
+        # first link to start at the target leg's origin; v11
+        # planned from the arrival node, which is a different
+        # node whenever the target leg's origin does not resolve
+        # to the previous leg's destination (the reader chains
+        # legs on raw node numbers, but an unknown node number
+        # falls back to a zone activity location, and the origin
+        # and destination picks of one zone can differ -- that
+        # mismatch crashed the v11 run at 94.8%). On a normally
+        # chained tour the two nodes are the same, so the choice
+        # below is identical to v11's.
         found = choose_charger_for_trigger(
-            engine.nearest_map, "plan_ahead", leg.dest_node,
+            engine.nearest_map, "plan_ahead",
+            target_leg.origin_node,
             target_leg.dest_node, veh.soc_kwh, consumption, battery,
             target_leg.enroute_target_soc, world=self.world,
             ff_net=engine._ff_net(), veh=veh, departure=departure)
@@ -1011,7 +1031,9 @@ class Simulator:
             # Charger AT the arrival node: forced dwell charge,
             # unless a dwell charge already ran there (its
             # outcome already reflects the post-charge SoC, and
-            # the dwell window is exhausted either way).
+            # the dwell window is exhausted either way). The
+            # vehicle is standing at this node now, so this
+            # holds whether or not the tour chains.
             if leg.decision == "destination" and \
                     leg.charge_outcome in ("charged-partial",
                                            "charged-destination",
@@ -1023,6 +1045,15 @@ class Simulator:
                 target_leg.enroute_target_soc)
             leg.trigger = "plan_ahead"
             leg.trigger_charger_id = site.charger_id
+            return
+        if site.node_id == target_leg.origin_node:
+            # Charger AT the next leg's origin but NOT at the
+            # arrival node (an unchained tour): the drive-to-
+            # charger leg would be empty, so there is no pending
+            # via to store, and the vehicle cannot dwell-charge
+            # there either -- it is not at that node now. Plan
+            # nothing; the next leg's own generation-time rules
+            # handle the charger.
             return
         target_leg.pending_via = (site, links_to, links_from,
                                   via_time)

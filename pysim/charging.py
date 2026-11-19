@@ -184,6 +184,35 @@ def _reconstruct_path(world, pred, origin_id, dest_id):
     return links
 
 
+def _via_matches_leg(world, site, links_to, links_from, leg):
+    # Structural contract of a stored en-route via for this leg
+    # (v12): the same checks _build_via_path enforces at
+    # generation, without raising. Both legs non-empty, the first
+    # link starts at the leg's origin, the last link ends at its
+    # destination, the two legs meet at the charger node, and the
+    # whole chain is connected. A pending plan-ahead via can fail
+    # this when it was planned for a different origin (see
+    # _plan_ahead_trigger in loading.py): the caller then
+    # re-plans or drops it instead of handing a bad via to
+    # generation.
+    if not links_to or not links_from:
+        return False
+    links = world.links
+    if links[links_to[0]].from_id != leg.origin_node:
+        return False
+    if links[links_from[-1]].to_id != leg.dest_node:
+        return False
+    if links[links_to[-1]].to_id != site.node_id:
+        return False
+    if links[links_from[0]].from_id != site.node_id:
+        return False
+    via = list(links_to) + list(links_from)
+    for a, b in zip(via, via[1:]):
+        if links[a].to_id != links[b].from_id:
+            return False
+    return True
+
+
 class ChargingEngine:
     # Inline charging for tour mode (slice 2): decisions are made
     # pre-trip at leg generation and destination/home charging is
@@ -376,14 +405,25 @@ class ChargingEngine:
         home_available = self._home_available(veh, leg)
         # Plan-ahead pending via (v5): a stop planned when the
         # previous leg completed, consumed at this leg's
-        # generation. Reachability is re-validated with the
-        # current starting charge; a via that no longer fits is
-        # dropped and the leg falls through to the v4 rules.
+        # generation. v12: the stored via is re-validated
+        # against the FULL generation contract -- endpoints,
+        # charger pass-through, connected chain, and both legs'
+        # energies -- not only the drive-to-charger energy as
+        # v11 did. A via that fails validation is stale (it was
+        # planned for a different origin: see
+        # _plan_ahead_trigger in loading.py), so it is re-planned
+        # fresh from this leg's true origin; only when no fresh
+        # via is viable either is the stop dropped and the leg
+        # falls through to the rules below.
         if leg.pending_via is not None:
             site, links_to, links_from, via_time = leg.pending_via
             leg.pending_via = None
-            if _links_energy(world, links_to, consumption) \
-                    <= soc + 1e-9:
+            if _via_matches_leg(world, site, links_to, links_from,
+                                leg) and \
+                    _links_energy(world, links_to, consumption) \
+                    <= soc + 1e-9 and \
+                    _links_energy(world, links_from, consumption) \
+                    <= leg.enroute_target_soc * battery + 1e-9:
                 leg.enroute_via = (links_to, links_from, via_time)
                 leg.decision = "enroute"
                 leg.decision_charger_id = site.charger_id
@@ -393,6 +433,28 @@ class ChargingEngine:
                 leg.trigger = "plan_ahead"
                 leg.trigger_charger_id = site.charger_id
                 return ("enroute", site, leg.enroute_target_soc)
+            found = choose_charger_for_trigger(
+                self.nearest_map, "plan_ahead", leg.origin_node,
+                leg.dest_node, soc, consumption, battery,
+                leg.enroute_target_soc, world=world,
+                ff_net=self._ff_net(), veh=veh,
+                departure=float(veh.departure))
+            if found is not None:
+                site, links_to, links_from, via_time = found
+                if site.node_id not in (leg.origin_node,
+                                        leg.dest_node) and \
+                        _via_matches_leg(world, site, links_to,
+                                         links_from, leg):
+                    leg.enroute_via = (links_to, links_from,
+                                       via_time)
+                    leg.decision = "enroute"
+                    leg.decision_charger_id = site.charger_id
+                    leg.decision_target_soc = leg.enroute_target_soc
+                    leg.decision_leg_energy_kwh = leg_energy
+                    leg.decision_remaining_kwh = remaining
+                    leg.trigger = "plan_ahead"
+                    leg.trigger_charger_id = site.charger_id
+                    return ("enroute", site, leg.enroute_target_soc)
             leg.trigger = ""
             leg.trigger_charger_id = ""
         # Opportunistic trigger (v5): a charger within walking
