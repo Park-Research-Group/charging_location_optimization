@@ -8,6 +8,7 @@ from collections import deque
 import numpy as np
 
 from .charging import DEFAULT_CONFIG
+from .consumption import MPH_TO_MPS
 from .cpp import (CsvParser, IniFile, LinkRNG, ProgramStop, VehicleGenerationRng,
                   WellRng, f32, parse_line)
 
@@ -73,7 +74,13 @@ class Link:
         "ring_arrival", "ring_departure",
         "departure_based_tt", "departure_count", "prevailing_tt",
         "buffer_waiting_time", "jam_time_stamp",
-        "org_geometry", "s3_consts")
+        "org_geometry", "s3_consts",
+        # v13 energy lookup: slope is a FRACTION (0.03 = 3%, as the
+        # Zenodo shapefile and input_link.csv carry it), None when
+        # the input has no slope column; speed_mps is the free-flow
+        # speed in m/s (speed_limit is in mph). Both feed the
+        # consumption lookup in pysim/consumption.py.
+        "slope", "speed_mps")
 
     def __init__(self):
         self.loading_buffer = deque()
@@ -97,6 +104,8 @@ class Link:
         self.jam_time_stamp = f32(0)
         self.org_geometry = ""
         self.s3_consts = None
+        self.slope = None
+        self.speed_mps = 0.0
 
     def setup_loading(self, horizon, min_inflow_ratio=0.0):
         # DTALink::SetupMOE (DTALite.h:2203) minus the MOE list: FFTT is
@@ -737,32 +746,47 @@ class World:
             if not ok:
                 wave = 12.0
             ok, geometry = parser.get("geometry", "str")
+            geometry_ok = ok
+            # v13: optional slope column, fraction (0.03 = 3%).
+            # Missing, blank or NaN means "no slope known": the
+            # link keeps slope None and the lookup falls back to
+            # the flat rate, so old inputs run v12-identical.
+            ok, slope = parser.get("slope", "double")
+            if not ok or slope is None or slope != slope:
+                slope = None
+            # The reverse of a two-way row runs downhill where the
+            # forward row runs uphill: negate the slope for it.
+            # A direction -1 row is itself the reverse of the
+            # written from -> to direction, so it negates too.
+            slope_rev = -slope if slope is not None else None
             if lanes == 0 or capacity < 1 or speed < 1:
                 continue
             if direction == 0:
                 self._add_link(from_name, to_name, length, lanes, speed,
                                capacity, k_jam, wave, link_type,
-                               geometry if ok else "")
+                               geometry if geometry_ok else "", slope)
                 self._add_link(to_name, from_name, length, lanes, speed,
                                capacity, k_jam, wave, link_type,
-                               geometry if ok else "")
+                               geometry if geometry_ok else "", slope_rev)
             elif direction == -1:
                 self._add_link(to_name, from_name, length, lanes, speed,
                                capacity, k_jam, wave, link_type,
-                               geometry if ok else "")
+                               geometry if geometry_ok else "", slope_rev)
             else:
                 self._add_link(from_name, to_name, length, lanes, speed,
                                capacity, k_jam, wave, link_type,
-                               geometry if ok else "")
+                               geometry if geometry_ok else "", slope)
             i += 1
 
     def _add_link(self, from_name, to_name, length, lanes, speed, capacity,
-                  k_jam, wave, link_type, geometry):
+                  k_jam, wave, link_type, geometry, slope=None):
         link = Link()
         link.link_no = len(self.links)
         link.from_id = self.node_index[from_name]
         link.to_id = self.node_index[to_name]
         speed_f = f32(speed)
+        link.slope = slope
+        link.speed_mps = float(speed) * MPH_TO_MPS
         length_f = f32(max(0.00001, length))
         if self.flow_model != 0:  # not BPR: minimum length from speed
             length_f = f32(max(length_f, f32(f32(speed_f * f32(0.1)) /
